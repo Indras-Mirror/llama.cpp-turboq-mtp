@@ -743,6 +743,11 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    struct ggml_tensor * get_tensor_mutable(const char * name);
+
+    // Called on sibling/MTP models post-load to wire shared tensors from the main model.
+    // Saves ~1 GB GPU RAM by avoiding duplicate output.weight and token_embd allocations.
+    virtual void link_shared_tensors(const llama_model * main_model) { (void)main_model; }
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

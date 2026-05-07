@@ -593,84 +593,101 @@ size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
 }
 
 // ---------------------------------------------------------------------------
-// TBQ4_0: TurboQuant 4-bit
+// TBQ4_0: TurboQuant 4-bit (FWHT rotation, 128-element blocks)
+//
+// Matches the Turbo4 CUDA algorithm: FWHT butterfly rotation → 4-bit
+// PolarQuant codebook → norm correction. CPU and CUDA produce identical output.
 // ---------------------------------------------------------------------------
 
-void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float * unit = turboq_get_scratch(QK_K);
-    float * rotated = turboq_get_scratch2(QK_K);
-    const uint64_t seed = turboq_seed_from_row(0);
-    const float scale_up = turboq_block_scale_up();
-
-    for (int64_t b = 0; b < nb; b++) {
-        const float * xb = x + b * QK_K;
-
-        float norm_sq = 0.0f;
-        for (int64_t j = 0; j < QK_K; ++j) {
-            norm_sq += xb[j] * xb[j];
-        }
-
-        float norm = sqrtf(norm_sq);
-        if (norm < 1e-10f) {
-            norm = 1e-10f;
-        }
-
-        for (int64_t j = 0; j < QK_K; ++j) {
-            unit[j] = xb[j] / norm;
-        }
-
-        turboq_rotate_block_forward(rotated, unit, seed);
-
-        memset(y[b].qs, 0, sizeof(y[b].qs));
-        for (int64_t j = 0; j < QK_K; j++) {
-            float val = rotated[j] * scale_up;
-            uint8_t idx = quantize_scalar_4bit(val);
-            if (j % 2 == 0) {
-                y[b].qs[j / 2] = idx;
-            } else {
-                y[b].qs[j / 2] |= (idx << 4);
+static void tbq4_fwht_128(float * x) {
+    for (int h = 1; h < 128; h *= 2) {
+        for (int i = 0; i < 128; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b; x[j + h] = a - b;
             }
         }
-        y[b].d = GGML_FP32_TO_FP16(norm);
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128;
+}
+
+static void tbq4_rotate_forward(float * x) {
+    for (int i = 0; i < 128; i++) x[i] *= turboq_wht_signs1[i];
+    tbq4_fwht_128(x);
+    for (int i = 0; i < 128; i++) x[i] *= turboq_wht_signs2[i];
+}
+
+static void tbq4_rotate_inverse(float * x) {
+    for (int i = 0; i < 128; i++) x[i] *= turboq_wht_signs2[i];
+    tbq4_fwht_128(x);
+    for (int i = 0; i < 128; i++) x[i] *= turboq_wht_signs1[i];
+}
+
+static inline uint8_t tbq4_find_nearest(float val) {
+    return quantize_scalar(val, turboq_fwht_midpoints_4bit, 15);
+}
+
+void quantize_row_tbq4_0_ref(const float * GGML_RESTRICT x, block_tbq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TBQ4 == 0);
+    const int64_t nb = k / QK_TBQ4;
+
+    for (int64_t b = 0; b < nb; b++) {
+        const float * xb = x + b * QK_TBQ4;
+
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_TBQ4; j++) norm_sq += xb[j] * xb[j];
+        float norm = sqrtf(norm_sq);
+        float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+        float rot[128];
+        for (int j = 0; j < 128; j++) rot[j] = xb[j] * inv_norm;
+        tbq4_rotate_forward(rot);
+
+        for (int j = 0; j < 128; j += 2) {
+            uint8_t idx0 = tbq4_find_nearest(rot[j]);
+            uint8_t idx1 = tbq4_find_nearest(rot[j + 1]);
+            y[b].qs[j / 2] = (idx1 << 4) | idx0;
+        }
+
+        float recon_sq = 0.0f;
+        for (int j = 0; j < 128; j++) {
+            uint8_t idx = (j & 1) ? (y[b].qs[j / 2] >> 4) : (y[b].qs[j / 2] & 0xF);
+            float r = turboq_fwht_centroids_4bit[idx];
+            recon_sq += r * r;
+        }
+        float recon_norm = sqrtf(recon_sq);
+        float corrected = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[b].d = GGML_FP32_TO_FP16(corrected);
     }
 }
 
 void dequantize_row_tbq4_0(const block_tbq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float * rotated = turboq_get_scratch(QK_K);
-    float * unit_approx = turboq_get_scratch2(QK_K);
-    const uint64_t seed = turboq_seed_from_row(0);
-    const float scale_down = turboq_block_scale_down();
+    assert(k % QK_TBQ4 == 0);
+    const int64_t nb = k / QK_TBQ4;
 
     for (int64_t b = 0; b < nb; b++) {
         const float norm = GGML_FP16_TO_FP32(x[b].d);
+        float rot[128];
 
-        for (int64_t j = 0; j < QK_K; j++) {
-            uint8_t idx;
-            if (j % 2 == 0) {
-                idx = x[b].qs[j / 2] & 0x0F;
-            } else {
-                idx = (x[b].qs[j / 2] >> 4) & 0x0F;
-            }
-            rotated[j] = turboq_codebook_4bit[idx] * scale_down;
+        for (int j = 0; j < 128; j++) {
+            uint8_t idx = (j & 1) ? (x[b].qs[j / 2] >> 4) : (x[b].qs[j / 2] & 0xF);
+            rot[j] = turboq_fwht_centroids_4bit[idx];
         }
 
-        turboq_rotate_block_inverse(unit_approx, rotated, seed);
+        tbq4_rotate_inverse(rot);
 
-        for (int64_t j = 0; j < QK_K; ++j) {
-            y[b * QK_K + j] = unit_approx[j] * norm;
+        for (int j = 0; j < 128; j++) {
+            y[b * QK_TBQ4 + j] = rot[j] * norm;
         }
     }
 }
 
 size_t quantize_tbq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
-    assert(n_per_row % QK_K == 0);
+    assert(n_per_row % QK_TBQ4 == 0);
 
-    const int64_t nb_per_row = n_per_row / QK_K;
+    const int64_t nb_per_row = n_per_row / QK_TBQ4;
     const size_t row_size = nb_per_row * sizeof(block_tbq4_0);
 
     for (int64_t row = 0; row < nrows; row++) {
