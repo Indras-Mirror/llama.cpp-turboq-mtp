@@ -2025,6 +2025,17 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+ggml_tensor * llama_model::get_tensor_mutable(const char * name) {
+    auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
+            [name](const std::pair<std::string, ggml_tensor *> & it) {
+                return it.first == name;
+            });
+    if (it == tensors_by_name.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
@@ -2406,6 +2417,10 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
     delete model;
+}
+
+void llama_model_link_shared_tensors(llama_model * model, const llama_model * trunk) {
+    model->link_shared_tensors(trunk);
 }
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {

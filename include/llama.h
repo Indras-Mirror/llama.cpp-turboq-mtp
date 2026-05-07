@@ -529,6 +529,12 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    // Wire shared tensors (output.weight, output_norm) from a trunk model into
+    // a sibling model (e.g. MTP head) to avoid ~1 GB of GPU duplication.
+    LLAMA_API void llama_model_link_shared_tensors(
+            struct llama_model * model,
+            const struct llama_model * trunk);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

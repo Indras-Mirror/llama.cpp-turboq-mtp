@@ -296,12 +296,13 @@ typedef struct {
 } block_tbq3_0;
 static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_K * 3 / 8, "wrong tbq3_0 block size/padding");
 
-// 4.0625 bpw
+// 4.125 bpw (128-element blocks, FWHT rotation, 4-bit PolarQuant)
+#define QK_TBQ4 128
 typedef struct {
-    uint8_t qs[QK_K / 2];
     ggml_half d;
+    uint8_t qs[QK_TBQ4 / 2];
 } block_tbq4_0;
-static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_K / 2, "wrong tbq4_0 block size/padding");
+static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ4 / 2, "wrong tbq4_0 block size/padding");
 
 // 3.125 bpw
 typedef struct {
