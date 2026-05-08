@@ -1,3 +1,8 @@
+# Internal handoff docs (keep local, not for GitHub)
+HANDOFF*.md
+COLLAB_NOTES.md
+DEEPSEEK_HANDOFF.md
+
 # Extensions
 
 *.a

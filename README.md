@@ -191,8 +191,7 @@ Implemented for `qwen35_mtp` and `qwen35moe_mtp`. Saves 682 MiB with zero qualit
 
 ## Documentation
 
-- **[HANDOFF_TBQ4.md](HANDOFF_TBQ4.md)** — Full technical internals: FWHT algorithm, guard structure, 15 bugs fixed, VRAM budgets
-- **[Blog post](https://indrasmirror.au/blog-mtp-shared-tensors-200k.html)** — Detailed writeup with benchmarks and optimization journey
+- **[Blog post](https://indrasmirror.au/blog-mtp-shared-tensors-200k.html)** — Detailed writeup with benchmarks, architecture, and optimization journey
 
 ---
 
