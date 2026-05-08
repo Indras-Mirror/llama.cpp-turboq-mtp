@@ -241,3 +241,118 @@ static void tbq4_rotate_output_cuda(
     if (DV != 128 && DV != 256) return;
     k_tbq4_rotate_output<<<(int)nrows, 128, 0, stream>>>(data, nrows, DV);
 }
+
+// ============================================================================
+// nstages=2 cp_async pipeline: raw TBQ4 byte copy + collaborative dequant
+// ============================================================================
+
+// Compute padded row stride for staging buffer (16-byte aligned).
+// block_tbq4_0 is 66 bytes (QK_TBQ4=128). Row = blocks_per_row * 66.
+// Padded to next 16-byte boundary for cp_async alignment.
+template<int D>
+static constexpr __host__ __device__ int tbq4_staging_row_bytes() {
+    constexpr int blocks_per_row = D / 128;
+    constexpr int raw_bytes      = blocks_per_row * (int)sizeof(block_tbq4_0);
+    constexpr int padded         = (raw_bytes + 15) & ~15;
+    return padded;
+}
+
+// Total staging buffer size for all rows in a batch.
+template<int D, int nbatch_fa>
+static constexpr __host__ __device__ size_t tbq4_staging_bytes() {
+    return (size_t)nbatch_fa * (size_t)tbq4_staging_row_bytes<D>();
+}
+
+// cp_async raw TBQ4 block data from GMEM into staging buffer in shared memory.
+// Copies entire rows including padding bytes to maintain 16-byte alignment.
+// No dequant — just raw byte copy via cp.async.
+//
+// Template params:
+//   D          - head dimension (128 or 256)
+//   nbatch_fa  - number of KV rows to copy
+//   nwarps     - number of warps
+// Load raw TBQ4 block data from GMEM into staging buffer using regular int loads.
+// Uses 4-byte int copies (33 per row for D=256) which handle misaligned addresses.
+// TBQ4 rows are 132 bytes (= 4×33) — not 16-byte aligned for cp_async.
+// Regular loads still benefit from warp-scheduled overlap (load+compute pipelining).
+template<int D, int nbatch_fa, int nwarps>
+static __device__ __forceinline__ void flash_attn_ext_tbq4_load_raw_async(
+        const char * __restrict__ data_raw,
+        char       * __restrict__ staging,
+        const int stride_bytes,
+        const int i_sup) {
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_row = D / 128;
+    constexpr int raw_row_bytes  = blocks_per_row * (int)sizeof(block_tbq4_0); // 132 for D=256
+    constexpr int ints_per_row   = raw_row_bytes / 4;                           // 33 for D=256
+    constexpr int total_ints     = nbatch_fa * ints_per_row;
+    constexpr int nthreads       = nwarps * warp_size;
+
+    // Distribute int-sized chunks across threads for coalesced access.
+    for (int idx = threadIdx.y * warp_size + threadIdx.x; idx < total_ints; idx += nthreads) {
+        const int row   = idx / ints_per_row;
+        const int off   = (idx % ints_per_row) * 4;
+
+        if (row < i_sup) {
+            const int src = __ldg((const int *)(data_raw + (int64_t)row * stride_bytes + off));
+            *(int *)(staging + (int64_t)row * tbq4_staging_row_bytes<D>() + off) = src;
+        }
+        // OOB rows: staging left uninitialized. Dequant zero-fill handles cleanup.
+    }
+}
+
+// Collaborative dequant: all threads convert raw TBQ4 blocks in staging
+// buffer to half2 tile. Each thread handles one column group across all rows,
+// same pattern as the synchronous tile loader.
+//
+// Template params match the synchronous loader for consistency.
+template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_tbq4_dequant_staging(
+        const char * __restrict__ staging,
+        half2      * __restrict__ tile,
+        const int i_sup) {
+
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_row  = D / 128;
+    constexpr int elems_per_block = 64;  // 128 floats → 64 half2 pairs
+    constexpr int elems_per_row   = blocks_per_row * elems_per_block;
+    constexpr int row_bytes       = tbq4_staging_row_bytes<D>();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+
+    for (int base_row = 0; base_row < nbatch_fa; base_row += (nthreads + elems_per_row - 1) / elems_per_row) {
+        const int idx        = tid;
+        const int elem_idx   = idx % elems_per_row;
+        const int row_offset = idx / elems_per_row;
+
+        if (row_offset + base_row >= nbatch_fa) continue;
+
+        const int blk_idx = elem_idx / elems_per_block;
+        const int b       = elem_idx % elems_per_block;
+
+        const char * row_ptr = staging + (int64_t)(base_row + row_offset) * row_bytes;
+        const block_tbq4_0 * blk = (const block_tbq4_0 *)(row_ptr) + blk_idx;
+        const float norm = __half2float(blk->d);
+
+        half cn_h[16];
+#pragma unroll
+        for (int c = 0; c < 16; c++) {
+            cn_h[c] = __float2half(d_tbq4_centroids[c] * norm);
+        }
+
+        const uint8_t byte = blk->qs[b];
+        tile[(base_row + row_offset) * stride_tile + elem_idx] =
+            __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
+    }
+
+    // Zero-fill OOB rows
+    if constexpr (oob_check) {
+        for (int r = tid; r < nbatch_fa; r += nthreads) {
+            if (r >= i_sup) {
+                for (int e = 0; e < elems_per_row; ++e) {
+                    tile[r * stride_tile + e] = make_half2(0.0f, 0.0f);
+                }
+            }
+        }
+    }
+}
