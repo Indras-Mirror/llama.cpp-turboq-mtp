@@ -138,7 +138,11 @@ void dequantize_tbq4_0(const void * vx, const int64_t ib, const int iqs, float2 
 }
 
 // Full-block dequant WITH inverse FWHT — for the ggml_cast / attention path.
-// One thread block (128 threads) per quantized block. Uses shared memory for butterfly.
+// One thread block (128 threads) per quantized block.
+//
+// Optimized: warp-shuffle butterfly for within-warp stages (h=1..16),
+// shared memory only for cross-warp stages (h=32,64). 7 barriers → 3 barriers.
+// All 128 threads active through all stages.
 static __global__ void k_tbq4_dequant_full(
         const block_tbq4_0 * __restrict__ src,
         float * __restrict__ dst,
@@ -151,32 +155,58 @@ static __global__ void k_tbq4_dequant_full(
     const float norm = __half2float(b->d);
     const int tid = threadIdx.x;
 
-    __shared__ float buf[128];
+    // Dequant + s2 sign (fused, per-element — no sync needed)
+    const uint8_t byte = b->qs[tid / 2];
+    const uint8_t idx = (tid & 1) ? (byte >> 4) : (byte & 0xF);
+    float val = d_tbq4_centroids[idx] * d_tbq4_wht_s2[tid];
 
-    // Dequant to rotated domain
-    uint8_t byte = b->qs[tid / 2];
-    uint8_t idx = (tid & 1) ? (byte >> 4) : (byte & 0xF);
-    buf[tid] = d_tbq4_centroids[idx];
-    __syncthreads();
-
-    // Inverse FWHT: s2 → butterfly → s1
-    buf[tid] *= d_tbq4_wht_s2[tid];
-    __syncthreads();
-
-    for (int h = 1; h < 128; h *= 2) {
-        if (tid < 64) {
-            int j = (tid / h) * (2 * h) + (tid % h);
-            float a = buf[j], bv = buf[j + h];
-            buf[j] = a + bv; buf[j + h] = a - bv;
+    // Stages 0-4 (h = 1, 2, 4, 8, 16): within-warp butterfly via warp shuffle.
+    // All 128 threads compute independently — no barriers, no shared memory.
+    // Thread t pairs with thread t^h via __shfl_xor_sync.
+    #pragma unroll
+    for (int h = 1; h <= 16; h *= 2) {
+        float partner = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
+        if ((tid & h) == 0) {
+            val = val + partner;   // lower partner
+        } else {
+            val = partner - val;   // upper partner
         }
-        __syncthreads();
     }
 
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    buf[tid] *= inv_sqrt_128 * d_tbq4_wht_s1[tid];
+    // Stages 5-6 (h = 32, 64): cross-warp — need shared memory.
+    // 3 barriers total (write initial, sync after stage 5, write stage 5 result).
+    __shared__ float buf[128];
+    buf[tid] = val;
     __syncthreads();
 
-    dst[bid * 128 + tid] = buf[tid] * norm;
+    // Stage 5: h=32
+    {
+        float partner = buf[tid ^ 32];
+        if ((tid & 32) == 0) {
+            val = val + partner;
+        } else {
+            val = partner - val;
+        }
+    }
+    __syncthreads();
+    buf[tid] = val;
+    __syncthreads();
+
+    // Stage 6: h=64
+    {
+        float partner = buf[tid ^ 64];
+        if ((tid & 64) == 0) {
+            val = val + partner;
+        } else {
+            val = partner - val;
+        }
+    }
+
+    // Final scaling (per-element, no sync needed)
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    val *= inv_sqrt_128 * d_tbq4_wht_s1[tid];
+
+    dst[bid * 128 + tid] = val * norm;
 }
 
 // Host launcher for full-block dequant
@@ -185,4 +215,165 @@ static void tbq4_dequant_full_cuda(
         int64_t n_blocks, cudaStream_t stream) {
     if (n_blocks <= 0) return;
     k_tbq4_dequant_full<<<(int)n_blocks, 128, 0, stream>>>(src, dst, n_blocks);
+}
+
+// ============================================================================
+// Block-Diagonal Hadamard (4×32) — alternative mode with ZERO barriers.
+//
+// Replaces the full 128-point FWHT with 4 independent 32-point transforms.
+// Each 32-point block fits entirely within a single warp (32 threads), so
+// all butterfly stages use __shfl_xor_sync — no __syncthreads() needed.
+//
+// Quality: SAW-INT4 (Together AI + Tri Dao, arXiv:2604.19157) shows
+// block-diagonal Hadamard achieves nearly identical quality to full FWHT
+// for KV cache quantization.
+//
+// IMPORTANT: This creates an incompatible block format. GGUFs quantized
+// with full 128-point FWHT CANNOT be dequantized with 32-point block-diagonal.
+// Enable with env var TBQ4_BD32=1 or compile-time #define.
+// ============================================================================
+
+// 32-point FWHT butterfly (in-register, operates on 32-element array)
+static __device__ __forceinline__
+void tbq4_fwht_32(float * x) {
+    for (int h = 1; h < 32; h *= 2) {
+        for (int i = 0; i < 32; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b; x[j + h] = a - b;
+            }
+        }
+    }
+    constexpr float inv_sqrt_32 = 0.1767766952966369f;
+    for (int i = 0; i < 32; i++) x[i] *= inv_sqrt_32;
+}
+
+// Block-diagonal rotation: 4 independent 32-point transforms.
+// Each 32-element block gets its own s1/s2 signs from the corresponding
+// slice of the 128-element sign arrays.
+
+static __device__ __forceinline__
+void tbq4_bd32_rotate_forward(float * x) {
+    for (int block = 0; block < 4; block++) {
+        float * bx = x + block * 32;
+        for (int i = 0; i < 32; i++) bx[i] *= d_tbq4_wht_s1[block * 32 + i];
+        tbq4_fwht_32(bx);
+        for (int i = 0; i < 32; i++) bx[i] *= d_tbq4_wht_s2[block * 32 + i];
+    }
+}
+
+static __device__ __forceinline__
+void tbq4_bd32_rotate_inverse(float * x) {
+    for (int block = 0; block < 4; block++) {
+        float * bx = x + block * 32;
+        for (int i = 0; i < 32; i++) bx[i] *= d_tbq4_wht_s2[block * 32 + i];
+        tbq4_fwht_32(bx);
+        for (int i = 0; i < 32; i++) bx[i] *= d_tbq4_wht_s1[block * 32 + i];
+    }
+}
+
+// Quantize with block-diagonal forward rotation (SET_ROWS path).
+// Produces identical block_tbq4_0 format but with 4×32 FWHT instead of 1×128.
+static __device__ __forceinline__
+void quantize_f32_tbq4_bd32_block(const float * src, block_tbq4_0 * dst) {
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float norm = sqrtf(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    tbq4_bd32_rotate_forward(x);
+
+    for (int j = 0; j < 128; j += 2) {
+        uint8_t idx0 = tbq4_find_nearest(x[j]);
+        uint8_t idx1 = tbq4_find_nearest(x[j + 1]);
+        dst->qs[j / 2] = (idx1 << 4) | idx0;
+    }
+
+    float recon_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        uint8_t idx = (j & 1) ? (dst->qs[j / 2] >> 4) : (dst->qs[j / 2] & 0xF);
+        float r = d_tbq4_centroids[idx];
+        recon_sq += r * r;
+    }
+    float recon_norm = sqrtf(recon_sq);
+    float corrected = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    dst->d = __float2half(corrected);
+}
+
+// Dequant kernel: 32 threads (ONE WARP), ZERO barriers.
+// Each thread owns 4 elements (same index within each 32-point block).
+// All 4 blocks process simultaneously via 4 parallel shuffle exchanges per stage.
+// 5 butterfly stages × 4 shuffle exchanges = 20 shuffle ops, 0 syncs.
+static __global__ void k_tbq4_bd32_dequant_full(
+        const block_tbq4_0 * __restrict__ src,
+        float * __restrict__ dst,
+        const int64_t n_blocks) {
+
+    const int64_t bid = blockIdx.x;
+    if (bid >= n_blocks) return;
+
+    const block_tbq4_0 * b = src + bid;
+    const float norm = __half2float(b->d);
+    const int tid = threadIdx.x;  // 0..31
+
+    // Load all 4 elements (one per block) + s2 sign
+    float val0, val1, val2, val3;
+    {
+        // Block 0: element tid + 0
+        int off = tid;
+        uint8_t byte = b->qs[off / 2];
+        uint8_t idx = (off & 1) ? (byte >> 4) : (byte & 0xF);
+        val0 = d_tbq4_centroids[idx] * d_tbq4_wht_s2[off];
+
+        // Block 1: element tid + 32
+        off = tid + 32;
+        byte = b->qs[off / 2];
+        idx = (off & 1) ? (byte >> 4) : (byte & 0xF);
+        val1 = d_tbq4_centroids[idx] * d_tbq4_wht_s2[off];
+
+        // Block 2: element tid + 64
+        off = tid + 64;
+        byte = b->qs[off / 2];
+        idx = (off & 1) ? (byte >> 4) : (byte & 0xF);
+        val2 = d_tbq4_centroids[idx] * d_tbq4_wht_s2[off];
+
+        // Block 3: element tid + 96
+        off = tid + 96;
+        byte = b->qs[off / 2];
+        idx = (off & 1) ? (byte >> 4) : (byte & 0xF);
+        val3 = d_tbq4_centroids[idx] * d_tbq4_wht_s2[off];
+    }
+
+    // Butterfly stages: h=1,2,4,8,16 — all within 32-thread warp.
+    // All 4 blocks processed simultaneously via independent shuffle exchanges.
+    #pragma unroll
+    for (int h = 1; h < 32; h *= 2) {
+        float p0 = __shfl_xor_sync(0xFFFFFFFF, val0, h, 32);
+        float p1 = __shfl_xor_sync(0xFFFFFFFF, val1, h, 32);
+        float p2 = __shfl_xor_sync(0xFFFFFFFF, val2, h, 32);
+        float p3 = __shfl_xor_sync(0xFFFFFFFF, val3, h, 32);
+        if ((tid & h) == 0) {
+            val0 += p0; val1 += p1; val2 += p2; val3 += p3;
+        } else {
+            val0 = p0 - val0; val1 = p1 - val1;
+            val2 = p2 - val2; val3 = p3 - val3;
+        }
+    }
+
+    // Final scaling + s1 sign
+    constexpr float inv_sqrt_32 = 0.1767766952966369f;
+    dst[bid * 128 + tid + 0]  = val0 * inv_sqrt_32 * d_tbq4_wht_s1[tid + 0]  * norm;
+    dst[bid * 128 + tid + 32] = val1 * inv_sqrt_32 * d_tbq4_wht_s1[tid + 32] * norm;
+    dst[bid * 128 + tid + 64] = val2 * inv_sqrt_32 * d_tbq4_wht_s1[tid + 64] * norm;
+    dst[bid * 128 + tid + 96] = val3 * inv_sqrt_32 * d_tbq4_wht_s1[tid + 96] * norm;
+}
+
+// Host launcher for block-diagonal dequant (32 threads/block, zero barriers)
+static void tbq4_bd32_dequant_full_cuda(
+        const block_tbq4_0 * src, float * dst,
+        int64_t n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    k_tbq4_bd32_dequant_full<<<(int)n_blocks, 32, 0, stream>>>(src, dst, n_blocks);
 }

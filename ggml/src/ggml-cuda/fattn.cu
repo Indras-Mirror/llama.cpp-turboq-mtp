@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-tbq4-launch.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -333,6 +334,8 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MMA_TBQ4 = 500,
+
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -349,6 +352,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TBQ4_0:
             return true;
         default:
             return false;
@@ -366,6 +370,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -446,6 +451,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (K->type == GGML_TYPE_TBQ4_0) {
+        if (V->type != GGML_TYPE_TBQ4_0) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if ((Q->ne[0] != 128 && Q->ne[0] != 256) || V->ne[0] != Q->ne[0]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (turing_mma_available(cc)) {
+            return BEST_FATTN_KERNEL_MMA_TBQ4;
+        }
         return BEST_FATTN_KERNEL_NONE;
     }
 
@@ -567,6 +585,135 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// TBQ4 ncols switch — generic on DKQ/DV, supports D=128 and D=256.
+template <int DKQ, int DV, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * Q = dst->src[0];
+
+    if constexpr (ncols2 <= 8) {
+        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || Q->ne[1] <= 32/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * KQV  = dst;
+
+    const int DKQ = (int)Q->ne[0];
+    const int DV  = (int)V->ne[0];
+    GGML_ASSERT(DKQ == 128 || DKQ == 256);
+    GGML_ASSERT(DV == DKQ);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const ggml_tensor * mask = dst->src[3];
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+#define TBQ4_DISPATCH_NCOLS1(DKQ_VAL, DV_VAL)                                        \
+    if (use_gqa_opt && gqa_ratio > 4) {                                              \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 8>(ctx, dst); \
+    } else if (use_gqa_opt && gqa_ratio > 2) {                                       \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 4>(ctx, dst); \
+    } else if (use_gqa_opt && gqa_ratio > 1) {                                       \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 2>(ctx, dst); \
+    } else {                                                                         \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 1>(ctx, dst); \
+    }
+
+    if (DKQ == 128) {
+        TBQ4_DISPATCH_NCOLS1(128, 128)
+    } else {
+        TBQ4_DISPATCH_NCOLS1(256, 256)
+    }
+
+#undef TBQ4_DISPATCH_NCOLS1
+
+    // Apply rotate_inverse to the output (rotated-domain → original domain).
+    const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
+    tbq4_rotate_output_cuda((float *) KQV->data, nrows, DV, ctx.stream());
+
+// TBQ4 ncols switch — generic on DKQ/DV, supports D=128 and D=256.
+template <int DKQ, int DV, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * Q = dst->src[0];
+
+    if constexpr (ncols2 <= 8) {
+        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || Q->ne[1] <= 32/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * KQV  = dst;
+
+    const int DKQ = (int)Q->ne[0];
+    const int DV  = (int)V->ne[0];
+    GGML_ASSERT(DKQ == 128 || DKQ == 256);
+    GGML_ASSERT(DV == DKQ);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const ggml_tensor * mask = dst->src[3];
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+#define TBQ4_DISPATCH_NCOLS1(DKQ_VAL, DV_VAL)                                        \
+    if (use_gqa_opt && gqa_ratio > 4) {                                              \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 8>(ctx, dst); \
+    } else if (use_gqa_opt && gqa_ratio > 2) {                                       \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 4>(ctx, dst); \
+    } else if (use_gqa_opt && gqa_ratio > 1) {                                       \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 2>(ctx, dst); \
+    } else {                                                                         \
+        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 1>(ctx, dst); \
+    }
+
+    if (DKQ == 128) {
+        TBQ4_DISPATCH_NCOLS1(128, 128)
+    } else {
+        TBQ4_DISPATCH_NCOLS1(256, 256)
+    }
+
+#undef TBQ4_DISPATCH_NCOLS1
+
+    // Apply rotate_inverse to the output (rotated-domain → original domain).
+    const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
+    tbq4_rotate_output_cuda((float *) KQV->data, nrows, DV, ctx.stream());
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -581,9 +728,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_MMA_TBQ4:
+            ggml_cuda_flash_attn_ext_mma_tbq4(ctx, dst);
+            break;
     }
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+

@@ -59,3 +59,13 @@ static const float turboq_fwht_midpoints_4bit[15] = {
     -0.046190f, -0.022832f,  0.000000f,  0.022832f,  0.046190f,
      0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f,
 };
+
+// 3-bit FWHT centroids — Lloyd-Max for N(0, 1/sqrt(128)), 8 levels
+static const float turboq_fwht_centroids_3bit[8] = {
+    -1.646828f, -0.895384f, -0.491349f, -0.157976f,
+     0.157976f,  0.491349f,  0.895384f,  1.646828f,
+};
+static const float turboq_fwht_midpoints_3bit[7] = {
+    -1.271106f, -0.693367f, -0.324663f, 0.0f,
+     0.324663f,  0.693367f,  1.271106f,
+};
