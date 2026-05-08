@@ -10,6 +10,10 @@
 // TBQ4 tile loader: reads block_tbq4_0 from GMEM, centroid lookup * norm -> half2 shmem tile.
 // No FWHT needed in the loader — we operate entirely in the rotated domain.
 // Each row has D/128 TBQ4 blocks. Each block is 66 bytes (2-byte norm + 64-byte qs).
+//
+// OPTIMIZED: Uses all nthreads threads for full utilization. Each thread handles one
+// "column group" (element index within a row) across all rows, rather than one row
+// across all columns. This achieves 100% thread utilization vs 25% (nbatch_fa/nthreads).
 template<int D, int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_tbq4_load_tile(
         const char * __restrict__ data_raw,
@@ -18,34 +22,49 @@ static __device__ __forceinline__ void flash_attn_ext_tbq4_load_tile(
         const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int blocks_per_row = D / 128;
+    constexpr int elems_per_block = 64; // pairs of 4-bit values → half2
+    constexpr int elems_per_row = blocks_per_row * elems_per_block; // = D/2
     const int tid = threadIdx.y * warp_size + threadIdx.x;
 
-    for (int row = tid; row < nbatch_fa; row += nthreads) {
-        if (oob_check && row >= i_sup) {
+    // Each thread handles one column group (elem_idx) across all rows.
+    // elem_idx = tid % elems_per_row, row = tid / elems_per_row
+    // With 128 threads and 128 elems/row for D=256: thread N handles elem N, row 0 only.
+    // For D=128 (64 elems/row): threads 0-63 handle elem 0-63, threads 64-127 handle elem 0-63 row 1.
+    constexpr int elems_per_pass = nthreads <= elems_per_row ? nthreads : nthreads / 2;
+
+    for (int base_row = 0; base_row < nbatch_fa; base_row += (nthreads + elems_per_row - 1) / elems_per_row) {
+        const int idx = tid;
+        const int elem_idx = idx % elems_per_row;
+        const int row_offset = idx / elems_per_row;
+
+        if (row_offset + base_row >= nbatch_fa) continue;
+
+        const int blk_idx = elem_idx / elems_per_block;
+        const int b       = elem_idx % elems_per_block;
+
+        // All threads that share a block need the same norm — redundant reads but no sync needed
+        const char * row_ptr = data_raw + (int64_t)(base_row + row_offset) * stride_bytes;
+        const block_tbq4_0 * blk = (const block_tbq4_0 *)(row_ptr) + blk_idx;
+        const float norm = __half2float(__ldg(&blk->d));
+
+        half cn_h[16];
 #pragma unroll
-            for (int b = 0; b < D/2; ++b) {
-                tile[row * stride_tile + b] = make_half2(0.0f, 0.0f);
-            }
-            continue;
+        for (int c = 0; c < 16; c++) {
+            cn_h[c] = __float2half(d_tbq4_centroids[c] * norm);
         }
 
-        const char * row_ptr = data_raw + (int64_t)row * stride_bytes;
+        const uint8_t byte = __ldg(&blk->qs[b]);
+        tile[(base_row + row_offset) * stride_tile + elem_idx] =
+            __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
+    }
 
-#pragma unroll
-        for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
-            const block_tbq4_0 * blk = (const block_tbq4_0 *)(row_ptr) + blk_idx;
-            const float norm = __half2float(blk->d);
-
-            half cn_h[16];
-#pragma unroll
-            for (int c = 0; c < 16; c++) {
-                cn_h[c] = __float2half(d_tbq4_centroids[c] * norm);
-            }
-
-#pragma unroll
-            for (int b = 0; b < 64; ++b) {
-                const uint8_t byte = blk->qs[b];
-                tile[row * stride_tile + blk_idx * 64 + b] = __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
+    // Zero-fill OOB rows — fallback to strided pattern for simplicity
+    if constexpr (oob_check) {
+        for (int r = tid; r < nbatch_fa; r += nthreads) {
+            if (r >= i_sup) {
+                for (int e = 0; e < elems_per_row; ++e) {
+                    tile[r * stride_tile + e] = make_half2(0.0f, 0.0f);
+                }
             }
         }
     }
