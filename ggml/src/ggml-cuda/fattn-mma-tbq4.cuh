@@ -56,16 +56,17 @@ static __device__ __forceinline__ void flash_attn_ext_tbq4_load_tile(
 // Uses warp shuffles for FWHT stages 0-4, shared memory for stages 5-6.
 // Each row of Q is DKQ elements, processed as DKQ/128 independent 128-point blocks.
 // Called once per kernel invocation (amortized over all K/V iterations).
+// q_fwht_buf: 128 floats in DYNAMIC shared memory (NOT static __shared__,
+// which causes nvcc codegen issues with extern __shared__ in the same kernel).
 template<int DKQ, int ncols, int nwarps>
-static __device__ __forceinline__ void tbq4_rotate_Q_tile(
+static __device__ __noinline__ void tbq4_rotate_Q_tile(
         half2 * __restrict__ tile_Q,
-        const int stride_tile_Q) {
+        const int stride_tile_Q,
+        float * __restrict__ q_fwht_buf) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int n_sub_blocks = DKQ / 128;
     static_assert(DKQ == 128 || DKQ == 256, "TBQ4 Q rotation only supports DKQ=128 or DKQ=256");
     const int tid = threadIdx.y * warp_size + threadIdx.x;
-
-    __shared__ float q_fwht_buf[128];
 
     for (int jc = 0; jc < ncols; ++jc) {
         if (tid < 128) {
@@ -76,14 +77,12 @@ static __device__ __forceinline__ void tbq4_rotate_Q_tile(
 
                 val *= d_tbq4_wht_s1[tid];
 
-                // FWHT stages 0-4: intra-warp via shuffles
 #pragma unroll
                 for (int h = 1; h <= 16; h *= 2) {
                     float partner = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
                     val = (tid & h) ? (partner - val) : (val + partner);
                 }
 
-                // Stages 5-6: cross-warp via shared memory
                 q_fwht_buf[tid] = val;
                 __syncthreads();
                 {
@@ -100,7 +99,6 @@ static __device__ __forceinline__ void tbq4_rotate_Q_tile(
                 constexpr float inv_sqrt_128 = 0.08838834764831845f;
                 val *= inv_sqrt_128 * d_tbq4_wht_s2[tid];
 
-                // Write back as half2 — pair adjacent elements
                 float partner_val = __shfl_xor_sync(0xFFFFFFFF, val, 1, 32);
                 if ((tid & 1) == 0) {
                     tile_Q[half2_offset] = __halves2half2(__float2half(val), __float2half(partner_val));
@@ -109,6 +107,63 @@ static __device__ __forceinline__ void tbq4_rotate_Q_tile(
         }
         __syncthreads();
     }
+}
+
+// Pre-attention kernel: apply rotate_forward to Q input.
+// Each row has DKQ elements, processed as DKQ/128 independent 128-point FWHT blocks.
+// rotate_forward(x) = s2 * (1/sqrt(128)) * FWHT(s1 * x)
+// Supports DKQ=128 (1 block) and DKQ=256 (2 blocks).
+static __global__ void k_tbq4_rotate_input(
+        float * __restrict__ data,
+        const int64_t nrows,
+        const int DKQ) {
+    const int64_t row = blockIdx.x;
+    if (row >= nrows) return;
+
+    const int tid = threadIdx.x;
+    float * row_data = data + row * DKQ;
+    const int n_blocks = DKQ / 128;
+
+    __shared__ float buf[128];
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const int offset = blk * 128;
+        float val = row_data[offset + tid];
+
+        val *= d_tbq4_wht_s1[tid];
+
+        // FWHT stages 0-4: warp shuffles
+#pragma unroll
+        for (int h = 1; h <= 16; h *= 2) {
+            float partner = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
+            val = (tid & h) ? (partner - val) : (val + partner);
+        }
+
+        // Stages 5-6: shared memory
+        buf[tid] = val;
+        __syncthreads();
+        {
+            float p = buf[tid ^ 32];
+            val = (tid & 32) ? (p - val) : (val + p);
+        }
+        buf[tid] = val;
+        __syncthreads();
+        {
+            float p = buf[tid ^ 64];
+            val = (tid & 64) ? (p - val) : (val + p);
+        }
+
+        constexpr float inv_sqrt_128 = 0.08838834764831845f;
+        row_data[offset + tid] = val * inv_sqrt_128 * d_tbq4_wht_s2[tid];
+    }
+}
+
+// Host function to apply rotate_forward to Q input (before FA kernel).
+static void tbq4_rotate_input_cuda(
+        float * data, int64_t nrows, int DKQ, cudaStream_t stream) {
+    if (nrows <= 0) return;
+    if (DKQ != 128 && DKQ != 256) return;
+    k_tbq4_rotate_input<<<(int)nrows, 128, 0, stream>>>(data, nrows, DKQ);
 }
 
 // Post-attention kernel: apply rotate_inverse to VKQ output.

@@ -577,13 +577,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(TURING_MMA_AVAILABLE)
-    T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
+    alignas(16) T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
+    alignas(16) T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #else // Volta
-    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
+    alignas(16) T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
 
+#if !defined(TBQ4_KV_FUSED)
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
@@ -593,9 +594,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         __syncthreads();
         flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
             (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
-    } else {
+    } else
+#endif
+    {
         constexpr bool use_cp_async = nstages == 1;
-        if (ncols2 > 1 || mask_h) {
+        if (mask_h && (ncols2 > 1 || mask_h)) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
@@ -617,11 +620,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     cp_async_wait_all();
                 }
             } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
+                asm volatile("" ::: "memory");
                 const char * K_raw = (const char *)K_h2;
                 constexpr int nthreads_tbq4 = nwarps * ggml_cuda_get_physical_warp_size();
                 const int stride_K_bytes = stride_K * int(sizeof(half2));
                 flash_attn_ext_tbq4_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_tbq4, oob_check>(
                     K_raw + int64_t(k_VKQ_0) * stride_K_bytes, tile_K, stride_K_bytes, k_VKQ_sup);
+                asm volatile("" ::: "memory");
             }
             __syncthreads();
         }
@@ -943,6 +948,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
+#if !defined(TBQ4_KV_FUSED)
     if constexpr (nstages > 1) {
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
         // Preload K tile for next iteration:
@@ -958,6 +964,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
         }
     }
+#endif
 
 
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
@@ -979,11 +986,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
                 __syncthreads();
             } else if constexpr (type_V == GGML_TYPE_TBQ4_0) {
+                asm volatile("" ::: "memory");
                 const char * V_raw = (const char *)V_h2;
                 constexpr int nthreads_tbq4 = nwarps * ggml_cuda_get_physical_warp_size();
                 const int stride_V_bytes = stride_V * int(sizeof(half2));
                 flash_attn_ext_tbq4_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_tbq4, oob_check>(
                     V_raw + int64_t(k_VKQ_0) * stride_V_bytes, tile_V, stride_V_bytes, k_VKQ_sup);
+                asm volatile("" ::: "memory");
                 __syncthreads();
             }
         }
@@ -1264,11 +1273,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     __syncthreads();
 
+    // Q rotation TEMPORARILY DISABLED for bisect
     // For TBQ4 rotated-domain attention: apply rotate_forward to Q in shared memory.
-    // Q_rot · K_stored = Q · K_original (because Hadamard transform is orthonormal).
-    if constexpr (is_tbq4_kv) {
-        tbq4_rotate_Q_tile<DKQ, ncols, nwarps>(tile_Q, stride_tile_Q);
-    }
+    // if constexpr (is_tbq4_kv) {
+    //     float * q_fwht_buf = (float *)(tile_Q + ncols * stride_tile_Q);
+    //     tbq4_rotate_Q_tile<DKQ, ncols, nwarps>(tile_Q, stride_tile_Q, q_fwht_buf);
+    // }
 
     if (Q_in_reg) {
         const int j0 = (threadIdx.y / np) * cols_per_warp;
@@ -1283,6 +1293,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     int kb0 = kb0_start;
 
+#if !defined(TBQ4_KV_FUSED)
     // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
@@ -1296,6 +1307,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
             (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
     }
+#endif
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1) {

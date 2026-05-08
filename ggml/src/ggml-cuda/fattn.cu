@@ -656,7 +656,9 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1(ggml_backend_cuda_co
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
-        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+        // 8/ncols2 branch: only for Turing where ncols=8 is valid.
+        // Volta+ requires ncols >= 32, so skip this branch there.
+        if (turing_mma_available(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
@@ -690,6 +692,10 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, g
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // Pre-rotate Q into rotated domain via SEPARATE kernel (avoids nvcc register spill bug)
+    const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
+    tbq4_rotate_input_cuda((float *) Q->data, nrows, DKQ, ctx.stream());
+
 #define TBQ4_DISPATCH_NCOLS1(DKQ_VAL, DV_VAL)                                        \
     if (use_gqa_opt && gqa_ratio > 4) {                                              \
         ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 8>(ctx, dst); \
@@ -710,7 +716,6 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, g
 #undef TBQ4_DISPATCH_NCOLS1
 
     // Apply rotate_inverse to the output (rotated-domain → original domain).
-    const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
     tbq4_rotate_output_cuda((float *) KQV->data, nrows, DV, ctx.stream());
 }
 
