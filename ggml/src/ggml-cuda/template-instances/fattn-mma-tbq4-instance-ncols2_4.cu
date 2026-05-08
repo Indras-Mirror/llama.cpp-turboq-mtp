@@ -1,4 +1,4 @@
-#define TBQ4_NSTAGES_2
+//#define TBQ4_NSTAGES_2
 #define TBQ4_KV_FUSED
 #include "../fattn-mma-f16.cuh"
 #include "../fattn-mma-tbq4-launch.cuh"
