@@ -42,20 +42,13 @@ static __device__ __forceinline__ void flash_attn_ext_tbq4_load_tile(
         const int blk_idx = elem_idx / elems_per_block;
         const int b       = elem_idx % elems_per_block;
 
-        // All threads that share a block need the same norm — redundant reads but no sync needed
         const char * row_ptr = data_raw + (int64_t)(base_row + row_offset) * stride_bytes;
         const block_tbq4_0 * blk = (const block_tbq4_0 *)(row_ptr) + blk_idx;
         const float norm = __half2float(__ldg(&blk->d));
-
-        half cn_h[16];
-#pragma unroll
-        for (int c = 0; c < 16; c++) {
-            cn_h[c] = __float2half(d_tbq4_centroids[c] * norm);
-        }
-
         const uint8_t byte = __ldg(&blk->qs[b]);
-        tile[(base_row + row_offset) * stride_tile + elem_idx] =
-            __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
+        const half lo = __float2half(d_tbq4_centroids[byte & 0xF] * norm);
+        const half hi = __float2half(d_tbq4_centroids[byte >> 4] * norm);
+        tile[(base_row + row_offset) * stride_tile + elem_idx] = __halves2half2(lo, hi);
     }
 
     // Zero-fill OOB rows — fallback to strided pattern for simplicity
@@ -333,16 +326,10 @@ static __device__ __forceinline__ void flash_attn_ext_tbq4_dequant_staging(
         const char * row_ptr = staging + (int64_t)(base_row + row_offset) * row_bytes;
         const block_tbq4_0 * blk = (const block_tbq4_0 *)(row_ptr) + blk_idx;
         const float norm = __half2float(blk->d);
-
-        half cn_h[16];
-#pragma unroll
-        for (int c = 0; c < 16; c++) {
-            cn_h[c] = __float2half(d_tbq4_centroids[c] * norm);
-        }
-
         const uint8_t byte = blk->qs[b];
-        tile[(base_row + row_offset) * stride_tile + elem_idx] =
-            __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
+        const half lo = __float2half(d_tbq4_centroids[byte & 0xF] * norm);
+        const half hi = __float2half(d_tbq4_centroids[byte >> 4] * norm);
+        tile[(base_row + row_offset) * stride_tile + elem_idx] = __halves2half2(lo, hi);
     }
 
     // Zero-fill OOB rows
