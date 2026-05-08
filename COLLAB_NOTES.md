@@ -131,11 +131,39 @@ All six checks pass:
 ### Minor Issue Found (non-blocking for 27B)
 V TBQ4 loader (line 912) doesn't include `i0_start` offset in GMEM pointer. For D=256 with nbatch_V2=128: single V iteration (i0_start=0), so no effect. Would need fixing for configs where DV > 2*nbatch_V2.
 
+### BUG 5: ncols2=1 dispatch to dead Volta MMA code (Gemma — FIXED locally)
+**File:** `ggml/src/ggml-cuda/fattn.cu`
+**Symptom:** When `use_gqa_opt=false` (short context), ncols2=1 → `<8,1>` with ncols=8. Volta MMA guard kills ncols<32 → `NO_DEVICE_CODE; return;` → uninitialized output → cascade failure.
+**Fix:** Restricted 8/ncols2 branch to Turing-only; Ada falls through to ncols1=32 path (`<32/ncols2, ncols2>`)
+
+### BUG 6: "misaligned address" in fused kernel (ONGOING)
+**Symptom:** Kernel activates `<256,256,4,8>`, printf at entry fires, crashes inside kernel body on first decode.
+**Config:** DKQ=256, ncols=32, nthreads=128, nbatch_fa=32, Q_in_reg=true, nstages=0, shmem=33792 (combine dominates)
+**Ruled out:**
+- ❌ Q rotation (disabled → still crashes)
+- ❌ Warmup-specific (--no-warmup → still crashes)  
+- ❌ K TBQ4 loader (zero-fill K tile → still crashes)
+- ❌ Stride mismatch (already fixed)
+- ❌ Template dispatch (printf confirms `<4,8>`)
+- ❌ Shmem overflow (33792 < 49152)
+- ❌ ldmatrix alignment (static analysis: all 16B-aligned)
+- ❌ K tensor layout (nb=[66,528,132,135168] verified correct)
+**ACTIVE:** Testing zero-fill BOTH K and V tiles. If still crashes → bug in kernel infrastructure (nstages=0 + Q_in_reg=true + TBQ4 types creates shmem layout issue). If fixed → V loader is culprit.
+
 ### Test Status
-BUG 4 found and fixed. Server needs rebuild and retest. quetzacodetl handles server restart.
+- GPU dequant baseline: 66 t/s @ 512 at 200K (works)
+- Fused kernel: crashes with "misaligned address" — BUG 6 under investigation
+- Q4_0 KV fallback: server confirmed alive (model loads fine)
+
+### MTP Context
+- Qwen3.6-27B MTP on 3090 Ti (q8 KV): ~47 tok/s reference (Reddit)
+- Our TBQ4 GPU dequant at 200K: 66 t/s @ 512 — 40% faster
+- Fused kernel target: 90+ t/s
+- Prefill reduced ~30% with MTP; vision currently broken with MTP (known)
 
 ## Peer Coordination
 **Relay:** MCP tool `mcp__quetza-relay__relay_ask` to `quetzacodetl-2` (DeepSeek) or `quetzacodetl` (Gemma/Claude)
 **Protocol:** Use `relay_ask` for NEW messages (not relay_reply — ask_ids expire quickly)
 **Thread:** `tbq4-coordination`
-**Current split:** quetzacodetl tests 27B server, quetzacodetl-2 verifies kernel + docs
+**Current split:** quetzacodetl tests/instruments kernel, quetzacodetl-2 verifies layout + docs
+**GitHub:** `github.com/Indras-Mirror/llama.cpp-mtp` branch `master` (push: `git push fork master`)
