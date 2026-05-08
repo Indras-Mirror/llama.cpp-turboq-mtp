@@ -24,7 +24,11 @@ void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggm
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
-    constexpr int nstages = 0;
+#ifdef TBQ4_NSTAGES_2
+    const int nstages = 2;
+#else
+    const int nstages = 0;
+#endif
 
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -33,15 +37,24 @@ void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggm
     constexpr bool V_is_K_view = false;
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_Q         = ncols                * (DKQ/2 + 4)                             * sizeof(half2);
     const size_t nbytes_shared_mask      = ncols1               * (nbatch_fa/2 + 4)                       * sizeof(half2);
     const size_t nbytes_shared_combine   = nwarps*cols_per_warp * (nbatch_combine + 4)                    * sizeof(half2);
 
-    const size_t nbytes_shared_KV = nbytes_shared_KV_1stage;
+    const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    // Layout: tile_Q | tile_K (if !Q_in_reg) | tile_V (if nstages>1) | tile_mask | tbq4_staging
+    const size_t nbytes_shared_base = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+
+    // nbatch_fa is runtime; compute staging size explicitly.
+    const size_t nbytes_shared_staging_actual = nstages > 1
+        ? (size_t)nbatch_fa * (size_t)(((DKQ/128) * sizeof(block_tbq4_0) + 15) & ~15)
+        : 0;
+
+    const size_t nbytes_shared_total = nbytes_shared_base + nbytes_shared_staging_actual;
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
