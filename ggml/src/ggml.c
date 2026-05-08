@@ -944,7 +944,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_TBQ3_0] = {
         .type_name                = "tbq3_0",
-        .blck_size                = QK_K,
+        .blck_size                = QK_TBQ3,
         .type_size                = sizeof(block_tbq3_0),
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_tbq3_0,

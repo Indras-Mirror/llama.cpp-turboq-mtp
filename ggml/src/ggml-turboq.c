@@ -515,75 +515,103 @@ static void unpack_3bit(uint8_t * indices, const uint8_t * src, int64_t n) {
 // TBQ3_0: TurboQuant 3-bit
 // ---------------------------------------------------------------------------
 
+static void tbq4_fwht_128(float * x); // forward decl — defined below in TBQ4_0 section
+
 void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float * unit = turboq_get_scratch(QK_K);
-    float * rotated = turboq_get_scratch2(QK_K);
-    const uint64_t seed = turboq_seed_from_row(0);
-    const float scale_up = turboq_block_scale_up();
-    uint8_t indices[QK_K];
+    assert(k % QK_TBQ3 == 0);
+    const int64_t nb = k / QK_TBQ3;
 
     for (int64_t b = 0; b < nb; b++) {
-        const float * xb = x + b * QK_K;
+        const float * xb = x + b * QK_TBQ3;
 
         float norm_sq = 0.0f;
-        for (int64_t j = 0; j < QK_K; ++j) {
-            norm_sq += xb[j] * xb[j];
-        }
-
+        for (int j = 0; j < QK_TBQ3; ++j) norm_sq += xb[j] * xb[j];
         float norm = sqrtf(norm_sq);
-        if (norm < 1e-10f) {
-            norm = 1e-10f;
+        if (norm < 1e-10f) norm = 1e-10f;
+
+        // Normalize + FWHT rotation (s1 + FWHT + s2, seed=42)
+        float rotated[QK_TBQ3];
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] = xb[j] / norm * turboq_wht_signs1[j];
+        tbq4_fwht_128(rotated);
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs2[j];
+
+        // 3-bit quantize via binary search over FWHT centroids
+        uint8_t indices[QK_TBQ3];
+        for (int j = 0; j < QK_TBQ3; j++) {
+            float v = rotated[j];
+            int idx = 3; // start at middle
+            if      (v < turboq_fwht_midpoints_3bit[0]) idx = 0;
+            else if (v < turboq_fwht_midpoints_3bit[1]) idx = 1;
+            else if (v < turboq_fwht_midpoints_3bit[2]) idx = 2;
+            else if (v < turboq_fwht_midpoints_3bit[3]) idx = 3;
+            else if (v < turboq_fwht_midpoints_3bit[4]) idx = 4;
+            else if (v < turboq_fwht_midpoints_3bit[5]) idx = 5;
+            else if (v < turboq_fwht_midpoints_3bit[6]) idx = 6;
+            else                                         idx = 7;
+            indices[j] = idx;
         }
 
-        for (int64_t j = 0; j < QK_K; ++j) {
-            unit[j] = xb[j] / norm;
+        // Pack 8 × 3-bit values into 3 bytes
+        memset(y[b].qs, 0, QK_TBQ3 * 3 / 8);
+        for (int j = 0; j < QK_TBQ3; j++) {
+            int byte_off = (j / 8) * 3 + (j % 8) / 8 * 0; // simplified: j/8*3
+            // Repack: 8 values per 3 bytes, little-endian bit packing
+            int block = j / 8;
+            int bit = (j % 8) * 3;
+            y[b].qs[block * 3 + 0] |= (indices[j] & 0x7) << (bit < 8 ? bit : 0);
+            if (bit >= 8) y[b].qs[block * 3 + 1] |= ((indices[j] >> (8 - bit)) & 0x7);
         }
 
-        turboq_rotate_block_forward(rotated, unit, seed);
-
-        for (int64_t j = 0; j < QK_K; j++) {
-            float val = rotated[j] * scale_up;
-            indices[j] = quantize_scalar_3bit(val);
-        }
-        pack_3bit(y[b].qs, indices, QK_K);
-        y[b].d = GGML_FP32_TO_FP16(norm);
+        // Norm correction: corrected = original / reconstruction norm
+        float recon_sq = 0.0f;
+        for (int j = 0; j < QK_TBQ3; j++) recon_sq += turboq_fwht_centroids_3bit[indices[j]] * turboq_fwht_centroids_3bit[indices[j]];
+        float recon_norm = sqrtf(recon_sq);
+        if (recon_norm < 1e-10f) recon_norm = 1e-10f;
+        y[b].d = GGML_FP32_TO_FP16(norm / recon_norm);
     }
 }
 
 void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_K == 0);
-    const int64_t nb = k / QK_K;
-    float * rotated = turboq_get_scratch(QK_K);
-    float * unit_approx = turboq_get_scratch2(QK_K);
-    const uint64_t seed = turboq_seed_from_row(0);
-    const float scale_down = turboq_block_scale_down();
-    uint8_t indices[QK_K];
+    assert(k % QK_TBQ3 == 0);
+    const int64_t nb = k / QK_TBQ3;
 
     for (int64_t b = 0; b < nb; b++) {
-        const float norm = GGML_FP16_TO_FP32(x[b].d);
+        const float norm_corrected = GGML_FP16_TO_FP32(x[b].d);
 
-        unpack_3bit(indices, x[b].qs, QK_K);
-        for (int64_t j = 0; j < QK_K; j++) {
-            rotated[j] = turboq_codebook_3bit[indices[j]] * scale_down;
+        // Unpack 3-bit values + centroid lookup
+        float rotated[QK_TBQ3];
+        for (int j = 0; j < QK_TBQ3; j++) {
+            int block = j / 8;
+            int bit = (j % 8) * 3;
+            uint8_t idx;
+            if (bit < 6) {
+                idx = (x[b].qs[block * 3 + 0] >> bit) & 0x7;
+            } else if (bit < 14) {
+                // Crosses byte boundary
+                uint32_t val = x[b].qs[block * 3 + 0] | (x[b].qs[block * 3 + 1] << 8);
+                idx = (val >> bit) & 0x7;
+            } else {
+                uint32_t val = x[b].qs[block * 3 + 1] | (x[b].qs[block * 3 + 2] << 8);
+                idx = (val >> (bit - 8)) & 0x7;
+            }
+            rotated[j] = turboq_fwht_centroids_3bit[idx];
         }
 
-        turboq_rotate_block_inverse(unit_approx, rotated, seed);
+        // Inverse FWHT
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs2[j];
+        tbq4_fwht_128(rotated);
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs1[j];
 
-        for (int64_t j = 0; j < QK_K; ++j) {
-            y[b * QK_K + j] = unit_approx[j] * norm;
-        }
+        // Scale by corrected norm
+        for (int j = 0; j < QK_TBQ3; ++j) y[b * QK_TBQ3 + j] = rotated[j] * norm_corrected;
     }
 }
 
 size_t quantize_tbq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
-    assert(n_per_row % QK_K == 0);
-
-    const int64_t nb_per_row = n_per_row / QK_K;
+    assert(n_per_row % QK_TBQ3 == 0);
+    const int64_t nb_per_row = n_per_row / QK_TBQ3;
     const size_t row_size = nb_per_row * sizeof(block_tbq3_0);
-
     for (int64_t row = 0; row < nrows; row++) {
         const float * row_src = src + row * n_per_row;
         block_tbq3_0 * row_dst = (block_tbq3_0 *)((char *)dst + row * row_size);

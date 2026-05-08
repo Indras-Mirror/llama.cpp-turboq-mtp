@@ -2567,10 +2567,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
 
         // Fused TBQ4 kernel requires per-head dim == 128 (QK_TBQ4).
-        // Fused kernel only supports per-head dim == 128 (QK_TBQ4, one block per head).
-        // D=256 needs tile layout redesign in fattn-mma-tbq4 for ldmatrix compatibility.
+        // Fused kernel supports per-head dims of 128 and 256 (1 or 2 TBQ4 blocks per head).
         const int64_t per_head_dim = n_embd_k_gqa / n_head_kv;
-        const bool use_tbq4_fused = use_flash_attn && per_head_dim == 128;
+        const bool use_tbq4_fused = use_flash_attn && (per_head_dim == 128 || per_head_dim == 256);
 
         if (!use_tbq4_fused) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F32);

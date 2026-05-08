@@ -289,12 +289,13 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 
 // TurboQuant blocks
 
-// 3.0625 bpw
+// 3.0625 bpw (128-element blocks, FWHT rotation, 3-bit PolarQuant)
+#define QK_TBQ3 128
 typedef struct {
-    uint8_t qs[QK_K * 3 / 8];
     ggml_half d;
+    uint8_t qs[QK_TBQ3 * 3 / 8]; // 48 bytes
 } block_tbq3_0;
-static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_K * 3 / 8, "wrong tbq3_0 block size/padding");
+static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + QK_TBQ3 * 3 / 8, "wrong tbq3_0 block size/padding");
 
 // 4.125 bpw (128-element blocks, FWHT rotation, 4-bit PolarQuant)
 #define QK_TBQ4 128
