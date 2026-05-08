@@ -2441,9 +2441,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_v_gqa % n_head_kv == 0);
 
-        // Same logic as K: fused kernel only supports per-head dim == 128.
+        // Same logic as K: fused kernel supports per-head dim 128 or 256.
         const int64_t per_head_dim = n_embd_v_gqa / n_head_kv;
-        const bool use_tbq4_fused = use_flash_attn && per_head_dim == 128;
+        const bool use_tbq4_fused = use_flash_attn && (per_head_dim == 128 || per_head_dim == 256);
 
         if (!use_tbq4_fused) {
             const ggml_type cast_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;

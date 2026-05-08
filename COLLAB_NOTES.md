@@ -104,7 +104,38 @@ cmake --build build -j$(nproc) --target llama-server
 touch ggml/src/ggml-cuda/fattn-mma-f16.cuh && cmake --build build -j$(nproc) --target llama-server
 ```
 
+## 2026-05-08 Session 2 — DeepSeek Kernel Verification + Test
+
+### Model Confirmed
+Qwen3.6-27B GGUF metadata: `key_length=256`, `value_length=256`, `head_count=24`, `head_count_kv=4`, `gqa_ratio=6`. **D=256 path is correct.**
+
+### D=256 Kernel Verification (DeepSeek / quetzacodetl-2)
+
+All six checks pass:
+
+1. **Template dispatch** (fattn.cu:587-602): gqa_ratio=6 → ncols2=8 → ncols=32 (ncols1=4). Ampere config: nthreads=128, nbatch_K2=128, nbatch_V2=128. Single iteration each for K and V at D=256. ✅
+2. **Q rotation** (fattn-mma-tbq4.cuh:70-108): `n_sub_blocks = 256/128 = 2`. Syncthreads at lines 88+94 are INSIDE the blk loop — block 0's FWHT stages 0-6 complete before block 1 starts. No shmem race. ✅
+3. **Output rotation** (fattn-mma-tbq4.cuh:118-161): `n_blocks = DV/128` — handles both D=128 and D=256. ✅
+4. **Stride fix**: K:572 and V:910 both use `stride * sizeof(half2)`. Bytes conversion correct. ✅
+5. **Template instances**: All 4 ncols2 variants (8/16/32/64) declared for DKQ=256 (lines 102-105). ✅
+6. **Tile layout**: nbatch_K2=128, stride_tile_K=132, TBQ4 loader writes 128 half2/row (2 blocks × 64). Padding correct. ✅
+
+### BUG 4: V-side D=256 pass-through missing (DeepSeek — FIXED)
+**File:** `src/llama-graph.cpp:1987`
+**Symptom:** Fused kernel never activated on 27B (38.75 t/s vs 85 t/s GPU dequant baseline at 200K)
+**Code:** `const bool use_tbq4_fused = use_flash_attn && per_head_dim == 128;` (V-side, line 1987)
+**K-side (line 1967):** `per_head_dim == 128 || per_head_dim == 256` — D=256 WAS allowed for K
+**Effect:** K passed through as raw TBQ4 but V cast to F16 → types mismatch → fused kernel check failed (requires both TBQ4) → fell to standard MMA_F16 with no Q rotation → garbage attention + slow path
+**Fix:** Changed to `per_head_dim == 128 || per_head_dim == 256` — matches K-side logic
+
+### Minor Issue Found (non-blocking for 27B)
+V TBQ4 loader (line 912) doesn't include `i0_start` offset in GMEM pointer. For D=256 with nbatch_V2=128: single V iteration (i0_start=0), so no effect. Would need fixing for configs where DV > 2*nbatch_V2.
+
+### Test Status
+BUG 4 found and fixed. Server needs rebuild and retest. quetzacodetl handles server restart.
+
 ## Peer Coordination
-**Relay:** MCP tool `mcp__quetza-relay__relay_ask` to `quetzacodetl-2` (DeepSeek)
+**Relay:** MCP tool `mcp__quetza-relay__relay_ask` to `quetzacodetl-2` (DeepSeek) or `quetzacodetl` (Gemma/Claude)
 **Protocol:** Use `relay_ask` for NEW messages (not relay_reply — ask_ids expire quickly)
-**DeepSeek's current focus:** Tile layout / ldmatrix analysis, D=256 kernel activation verification
+**Thread:** `tbq4-coordination`
+**Current split:** quetzacodetl tests 27B server, quetzacodetl-2 verifies kernel + docs
