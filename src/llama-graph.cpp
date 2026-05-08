@@ -2408,8 +2408,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0 ||
         v->type == GGML_TYPE_TBQP3_0 || v->type == GGML_TYPE_TBQP4_0;
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
-    const enum ggml_type tbq_attn_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
-
     // split the batch into streams if needed
     const auto n_stream = k_is_tbq ? k->ne[2] : (v_is_tbq ? v->ne[2] : k->ne[3]);
 
@@ -2422,8 +2420,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
 
-        k = ggml_cast(ctx0, k, tbq_attn_type);
-        cb(k, use_flash_attn ? "k_tbq_f16" : "k_tbq_f32", il);
+        // Fused TBQ4 kernel requires per-head dim == 128 (QK_TBQ4).
+        // Fused kernel only supports per-head dim == 128 (QK_TBQ4, one block per head).
+        // D=256 needs tile layout redesign in fattn-mma-tbq4 for ldmatrix compatibility.
+        const int64_t per_head_dim = n_embd_k_gqa / n_head_kv;
+        const bool use_tbq4_fused = use_flash_attn && per_head_dim == 128;
+
+        if (!use_tbq4_fused) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+            cb(k, "k_tbq_f32", il);
+        }
 
         k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
         cb(k, "k_tbq_reshaped", il);
@@ -2436,8 +2442,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_head_kv > 0);
         GGML_ASSERT(n_embd_v_gqa % n_head_kv == 0);
 
-        v = ggml_cast(ctx0, v, tbq_attn_type);
-        cb(v, use_flash_attn ? "v_tbq_f16" : "v_tbq_f32", il);
+        // Same logic as K: fused kernel only supports per-head dim == 128.
+        const int64_t per_head_dim = n_embd_v_gqa / n_head_kv;
+        const bool use_tbq4_fused = use_flash_attn && per_head_dim == 128;
+
+        if (!use_tbq4_fused) {
+            const ggml_type cast_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+            v = ggml_cast(ctx0, v, cast_type);
+            cb(v, use_flash_attn ? "v_tbq_f16" : "v_tbq_f32", il);
+        }
 
         v = ggml_reshape_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2]);
         cb(v, "v_tbq_reshaped", il);
