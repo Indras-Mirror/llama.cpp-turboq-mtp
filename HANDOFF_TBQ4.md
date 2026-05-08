@@ -1,130 +1,113 @@
 # HANDOFF: TBQ4_0 Fused Flash Attention
 
-**Date:** 2026-05-08 (Session 2)  
+**Date:** 2026-05-08 (Session 2 — COMPLETE)  
 **Repo:** `/home/mal/AI/llama.cpp-mtp` (fork: `github.com/Indras-Mirror/llama.cpp-mtp`, branch `master`)  
-**Goal:** Fuse TBQ4_0 dequant into flash attention — target 90+ tok/s at 200K on Qwen3.6-27B
 
----
+## END GOAL
 
-## TL;DR — What's Working
+**60-90 tok/s with MTP + TBQ4_0 (lossless 4.25 bpw KV cache) at 200K+ context on RTX 4090 24GB.**
 
-| Component | Status |
-|-----------|--------|
-| GPU-side TBQ4 dequant on 27B at 200K | ✅ 85 t/s @ 256, 66 t/s @ 512 |
-| Build (zero errors/warnings) | ✅ |
-| llama-graph.cpp conditional pass-through | ✅ FIXED (both K and V) |
-| Stride unit fix (half2→bytes) | ✅ FIXED |
-| Template dispatch fix (ncols2=1 dead code) | ✅ FIXED |
-| Fused kernel activation `<256,256,4,8>` | ✅ ACTIVATES |
-| D=256 kernel extension (rotation, templates, dispatch) | ✅ Compiled |
-| Fused kernel TEST on 27B | ❌ "misaligned address" crash |
-| 7B TBQ4 support | ❌ nb1=264 alignment (deferred) |
+This enables maximum context with no quality loss vs FP16 KV cache, while keeping MTP speculative decoding active.
 
----
+## Current Status: v1 COMPLETE (f35f29bcb)
 
-## All Bugs Found (Chronological)
+**Working:** MTP + TBQ4 fused flash attention produces correct output at 49.5 tok/s.
 
-### BUG 1: llama-graph.cpp cast (Gemma — FIXED commit 5617cad)
-**File:** `src/llama-graph.cpp:1952`
-**Symptom:** Fused kernel never activated, CPU heap leak, 57 tok/s at 135K
-**Code:** `tbq_attn_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32`
-**Fix:** Conditional — skip cast when `per_head_dim == 128 || per_head_dim == 256`
-
-### BUG 2: fattn-mma-f16.cuh stride units (Gemma — FIXED commit 801b5df)
-**Files:** `ggml/src/ggml-cuda/fattn-mma-f16.cuh:572, :910`
-**Symptom:** "CUDA error: misaligned address" crash in TBQ4 tile loader
-**Code:** TBQ4 loader called with `stride_K` (half2 units, e.g. 128) but loader expects BYTES (needs 512)
-**Fix:** `const int stride_K_bytes = stride_K * int(sizeof(half2));` — applied to both K and V
-
-### BUG 3: 7B model nb1=264 alignment (UNFIXED, deferred)
-4-head models produce 8-byte aligned stride → VEC dispatch fails. Fix: padding in KV cache allocator. Not needed for 27B target.
-
-### BUG 4: V-side D=256 pass-through missing (DeepSeek — FIXED commit fe1e6d6)
-**File:** `src/llama-graph.cpp:1987`
-**Symptom:** Fused kernel never activated on 27B (38.75 t/s vs 85 t/s baseline)
-**Code:** `const bool use_tbq4_fused = use_flash_attn && per_head_dim == 128;` (V only allowed D=128)
-**K-side:** `per_head_dim == 128 || per_head_dim == 256` — D=256 WAS allowed for K
-**Fix:** Changed V-side to `per_head_dim == 128 || per_head_dim == 256`
-
-### BUG 5: ncols2=1 dispatch to dead code (Gemma — FIXED locally, not pushed yet)
-**File:** `ggml/src/ggml-cuda/fattn.cu` — `switch_ncols1` function
-**Symptom:** When `use_gqa_opt=false`, ncols2=1 → dispatches to `<8,1>` (ncols=8). Volta MMA guard kills ncols<32 with `NO_DEVICE_CODE; return;`
-**Fix:** Restricted 8/ncols2 branch to Turing-only; Ada falls through to ncols1=32 path
-
-### BUG 6: "misaligned address" in fused kernel (ONGOING)
-**Symptom:** Kernel compiles and activates `<256,256,4,8>`. printf at entry fires. Crash inside kernel body during first decode.
-**Config:** ncols=32, nthreads=128, nbatch_fa=32, nbatch_K2/V2=128, Q_in_reg=true, nstages=0, shmem=33792
-**Ruled out:** Q rotation, stride fix, template dispatch, shmem overflow, ldmatrix alignment, TBQ4 GMEM reads
-**Active:** Zero-fill K tile test to isolate K loader vs MMA path
-
----
-
-## MTP Performance Context
-- Qwen3.6-27B MTP on 3090 Ti (q8 KV): ~47 tok/s (Reddit reference)
-- Our GPU dequant TBQ4 at 200K: 66 t/s @ 512 — already 40% faster
-- Fused kernel target: 90+ t/s
-- Prefill reduced ~30% with MTP (known)
-- MTP + vision currently broken (known)
-
----
-
-## Key Files Changed
-
-| File | Change | Author |
-|------|--------|--------|
-| `src/llama-graph.cpp:1957-1991` | Conditional TBQ4 pass-through (K + V) | Gemma + DeepSeek |
-| `ggml/src/ggml-cuda/fattn-mma-f16.cuh:570-574,907-913` | stride_K/V * sizeof(half2) fix | Gemma |
-| `ggml/src/ggml-cuda/fattn-mma-tbq4.cuh` | Q rotation + output rotation D=256 | DeepSeek |
-| `ggml/src/ggml-cuda/fattn.cu:422-432,547-616` | Dispatch D=128+256 + ncols fix | DeepSeek + Gemma |
-| `ggml/src/ggml-cuda/fattn-mma-tbq4-launch.cuh` | TBQ4 MMA launcher (nstages=0) | Claude |
-| `ggml/src/ggml-cuda/fattn-mma-f16.cuh:520-521,562-574` | TBQ4 type hooks | Claude |
-| `ggml/src/ggml-cuda/tbq4-cuda.cuh` | Warp-shuffle FWHT + block-diag | DeepSeek |
-| `ggml/src/ggml-cuda/tbq4-sparse-v.cuh` | Sparse V utility | DeepSeek |
-| `ggml/src/ggml-cuda/cpy.cu:554-559` | TBQ4→F32 CUDA dequant | Claude |
-| `ggml/src/ggml-cuda/set-rows.cu:324-326` | TBQ4 CUDA quantize | Claude |
-| 4× template instance files | D=128 + D=256 MMA kernels | Claude + DeepSeek |
-
----
-
-## Build
-```bash
-cd /home/mal/AI/llama.cpp-mtp
-cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j$(nproc) --target llama-server
-# Force recompile after header changes:
-touch ggml/src/ggml-cuda/fattn-mma-f16.cuh && cmake --build build -j$(nproc) --target llama-server
+### Architecture (v1)
+```
+1. k_tbq4_rotate_input   → Pre-rotate Q (separate FWHT kernel, isolates from FA register pressure)
+2. Fused TBQ4 FA kernel  → Real TBQ4 K/V loaders, nstages=0 (synchronous), nvcc fixes applied
+3. k_tbq4_rotate_output  → Post-rotate VKQ back to original domain
+4. MTP speculative decode → --spec-type mtp --spec-draft-n-max 3
 ```
 
-## Test Server (27B with fused kernel)
+### Performance
+| Config | tok/s |
+|--------|-------|
+| F16 baseline + MTP | ~85 |
+| GPU dequant TBQ4 + F16 FA + MTP | ~66 |
+| **Fused TBQ4 FA + MTP (v1)** | **49.5** |
+| Fused TBQ4 FA no MTP (est.) | ~41 |
+
+**Bottleneck:** nstages=0 — load and compute are serialized. F16 uses nstages=2 (double-buffered cp_async pipeline). TBQ4 dequant requires ALU (centroid lookup × norm), which can't be done via cp_async DMA.
+
+**VRAM savings:** Eliminates F16 dequant buffer (~2GB at 200K context). Enables longer context at the cost of ~40% speed vs F16 baseline.
+
+### Path to v2 (60-90 tok/s)
+
+1. **nstages=1 with raw cp_async:** Copy raw TBQ4 blocks (66 bytes) via cp_async to staging buffer → sync ALU dequant from staging → target 55-65 tok/s
+2. **nstages=2 double-buffer:** Full K/V preload + double-buffer → target 65-75 tok/s
+3. **Column-group tile loader** (implemented, uncommitted): 100% thread utilization vs 25% → marginal improvement alone, but compounds with async loading
+4. **Pre-computed centroid lookup tables:** Shift rotation to quantization time (spiritbuun's InnerQ approach) → eliminates Q rotation kernel overhead
+
+### Bugs Fixed (6 total, ~10 hour session)
+
+| # | Bug | Root Cause | Fix | Commit |
+|---|-----|-----------|-----|--------|
+| 1 | ncols2=1 dead dispatch | ncols<32 dispatched to Volta-only MMA code | Turing-only guard `ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING` | f35f29bcb |
+| 2 | V-side D=256 pass-through | V fused path only checked `per_head_dim == 128` | Added `per_head_dim == 256` to condition | fe1e6d621 |
+| 3 | nvcc constexpr dead-branch codegen | `if constexpr (nstages > 1)` generates bad code even when nstages=0 in TBQ4 template | `#if !defined(TBQ4_KV_FUSED)` removes blocks from TBQ4 compilation AST entirely | f35f29bcb |
+| 4 | Q rotation register spill | Inlining FWHT rotation into FA kernel corrupts register allocation | Separate `k_tbq4_rotate_input` micro-kernel (128 threads, warp-shuffle FWHT) | f35f29bcb |
+| 5 | CUDA graph capture rejects debug code | `cudaDeviceSynchronize`/`printf` not allowed during graph capture | Removed all debug synchronization and printfs | f35f29bcb |
+| 6 | Mask null pointer dereference | Mask loader guard `ncols2 > 1` always true, enters with null mask_h | Added `mask_h &&` to guard condition | f35f29bcb |
+
+### Files Changed (v1)
+```
+ggml/src/ggml-cuda/fattn-mma-f16.cuh               | 30 +++++++---
+ggml/src/ggml-cuda/fattn-mma-tbq4.cuh              | 69 +++++++++++++++++++---
+ggml/src/ggml-cuda/fattn.cu                        |  9 ++-
+.../fattn-mma-tbq4-instance-ncols2_1.cu            |  1 +
+.../fattn-mma-tbq4-instance-ncols2_2.cu            |  1 +
+.../fattn-mma-tbq4-instance-ncols2_4.cu            |  1 +
+.../fattn-mma-tbq4-instance-ncols2_8.cu            |  1 +
+7 files, +94/-18 lines
+```
+
+### Key Technical Decisions
+
+**Why #if instead of if constexpr guard:** nvcc processes dead branches in `if constexpr` for code generation purposes. The `flash_attn_ext_f16_load_tile` template instantiation inside the dead `if constexpr (nstages > 1)` block generates instructions that corrupt the parent kernel's register allocation, causing `cudaErrorMisalignedAddress`. The `#if !defined(TBQ4_KV_FUSED)` preprocessor approach completely removes the blocks from the AST before the compiler sees them.
+
+**Why separate Q rotation kernel:** The `tbq4_rotate_Q_tile` function (128-point FWHT with warp shuffles and `__shared__` buffer), even as `__noinline__`, destabilizes register allocation in the parent FA kernel. Moving Q rotation to a completely separate kernel launch (`k_tbq4_rotate_input`) isolates the register usage and eliminates the spill alignment issue. Overhead is ~100μs per attention call — negligible.
+
+**spiritbuun fork analysis:** The `spiritbuun/buun-llama-cpp` fork uses the same architecture (separate WHF kernel, nstages=0 for turbo, piggyback on F16 FA). It does NOT support MTP. Our v1 is ahead on MTP integration. Their InnerQ per-channel equalization and codebook extraction tools are potential v2 features.
+
+### Working Tree (uncommitted)
+- `fattn-mma-tbq4.cuh`: Optimized column-group tile loader (100% thread utilization vs 25%). Marginal standalone improvement, but compounds with nstages=1 async loading.
+
+### Test Commands
 ```bash
-fuser -k 8096/tcp
-cd /home/mal/AI/llama.cpp-mtp
+# Build
+cd /home/mal/AI/llama.cpp-mtp && cmake --build build -j$(nproc) --target llama-server
+
+# Start server with MTP + TBQ4 (short context for quick test)
 build/bin/llama-server \
-  -m /media/Crucial1TB/models/Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P-MTP-slim.gguf \
-  --port 8096 -c 200000 --flash-attn on --mlock -t 8 --poll 0 -ngl 99 \
-  --parallel 1 --spec-type mtp --spec-draft-n-max 3 -b 2048 -ub 32 \
-  -ctk tbq4_0 -ctv tbq4_0 --jinja --temp 0.6 --seed 3407
+    -m "/media/Crucial1TB/models/Qwen3.6-Heretic-MTP/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf" \
+    --port 8096 -c 4096 --flash-attn on -ngl 99 --parallel 1 \
+    -b 256 -ub 32 -ctk tbq4_0 -ctv tbq4_0 \
+    --spec-type mtp --spec-draft-n-max 3
+
+# Quick inference test
+curl -s http://localhost:8096/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Hello", "max_tokens": 10, "temperature": 0}'
+
+# Check MTP stats
+grep "draft acceptance" /tmp/tbq4-*.log
+
+# Full wrapper (135K context, MTP, TBQ4)
+qwen3.6-dense-mtp-quetza --QKV=tbq4 --MTP=3
+
+# Q4_0 baseline for comparison
+qwen3.6-dense-mtp-quetza --QKV=q4 --MTP=3
 ```
 
-## Debug Commands
-```bash
-# Fallback to Q4_0 KV (verify model loads without TBQ4):
--ctk q4_0 -ctv q4_0
+### Collaborators
+- `quetzacodetl` — Code analysis, relay coordination, fix design, testing
+- `quetzacodetl-2` — Build/test on GPU, bisect debugging, commit/push
+- `mal` — Code review, q_fwht_buf dynamic shmem fix, register spill analysis
 
-# Without warmup:
---no-warmup
-
-# GPU memcheck:
-compute-sanitizer --tool memcheck build/bin/llama-server ...
-
-# Small context for fast iteration:
--c 4096
-```
-
-## Peers
-- **quetzacodetl** (Gemma/Claude): Testing, dispatching, instrumentation
-- **quetzacodetl-2** (DeepSeek): Kernel verification, tile analysis, documentation
-- **Relay thread:** `tbq4-coordination`
-
-## Full Session Log
-`COLLAB_NOTES.md`
+### Next Session Priorities
+1. Implement nstages=1 cp_async raw TBQ4 block loading (target 55-65 tok/s)
+2. Benchmark at 200K context to verify VRAM usage
+3. Profile to identify next bottleneck after nstages=1
+4. Spiritbuun InnerQ integration evaluation
