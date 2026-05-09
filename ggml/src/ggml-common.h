@@ -305,23 +305,35 @@ typedef struct {
 } block_tbq4_0;
 static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + QK_TBQ4 / 2, "wrong tbq4_0 block size/padding");
 
-// 3.125 bpw
+// PlanarQuant 3-bit: 2D Givens rotation + 2-bit scalar + 1-bit QJL
+// 50 bytes per 128 values = 3.125 bits/value
+#define QK_PLANAR3 128
 typedef struct {
-    uint8_t qs[QK_K / 4];
-    uint8_t signs[QK_K / 8];
-    ggml_half d;
-    ggml_half gamma;
-} block_tbqp3_0;
-static_assert(sizeof(block_tbqp3_0) == 2*sizeof(ggml_half) + QK_K / 4 + QK_K / 8, "wrong tbqp3_0 block size/padding");
+    ggml_half d;                      //  2 bytes: group norm (fp16)
+    uint8_t   qs[QK_PLANAR3 / 4];     // 32 bytes: 2-bit indices (4 per byte)
+    uint8_t   signs[QK_PLANAR3 / 8];  // 16 bytes: 1-bit signs
+} block_planar3_0;                     // 50 bytes total
+static_assert(sizeof(block_planar3_0) == sizeof(ggml_half) + QK_PLANAR3/4 + QK_PLANAR3/8, "wrong planar3_0 block size/padding");
 
-// 4.125 bpw
+// IsoQuant 3-bit: quaternion 4D rotation + 2-bit scalar + 1-bit QJL
+// Same block layout as PlanarQuant 3-bit
+#define QK_ISO3 128
 typedef struct {
-    uint8_t qs[QK_K * 3 / 8];
-    uint8_t signs[QK_K / 8];
     ggml_half d;
-    ggml_half gamma;
-} block_tbqp4_0;
-static_assert(sizeof(block_tbqp4_0) == 2*sizeof(ggml_half) + QK_K * 3 / 8 + QK_K / 8, "wrong tbqp4_0 block size/padding");
+    uint8_t   qs[QK_ISO3 / 4];
+    uint8_t   signs[QK_ISO3 / 8];
+} block_iso3_0;
+static_assert(sizeof(block_iso3_0) == sizeof(ggml_half) + QK_ISO3/4 + QK_ISO3/8, "wrong iso3_0 block size/padding");
+
+// PlanarQuant 4-bit: 2D Givens rotation + 4-bit nibble-packed
+// Reuses block_tbq4_0 layout (66 bytes: 2 norm + 64 qs)
+#define QK_PLANAR4 128
+typedef block_tbq4_0 block_planar4_0;
+
+// IsoQuant 4-bit: quaternion 4D rotation + 4-bit nibble-packed
+// Reuses block_tbq4_0 layout
+#define QK_ISO4 128
+typedef block_tbq4_0 block_iso4_0;
 
 //
 // Super-block quantization structures
@@ -1945,3 +1957,4 @@ GGML_TABLE_END()
 
 #endif // GGML_COMMON_IMPL
 #endif // GGML_COMMON_IMPL
+

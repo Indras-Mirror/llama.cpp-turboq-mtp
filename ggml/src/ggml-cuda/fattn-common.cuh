@@ -3,6 +3,8 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "planar-iso-constants.cuh"
+#include "fattn-planar-iso.cuh"
 
 #include <cstdint>
 
@@ -633,6 +635,14 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_PLANAR3_0) {
+        return vec_dot_fattn_vec_KQ_planar3_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_ISO3_0) {
+        return vec_dot_fattn_vec_KQ_iso3_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_PLANAR4_0) {
+        return vec_dot_fattn_vec_KQ_planar4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_ISO4_0) {
+        return vec_dot_fattn_vec_KQ_iso4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -655,6 +665,14 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_PLANAR3_0) {
+        return dequantize_V_planar3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_ISO3_0) {
+        return dequantize_V_iso3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_PLANAR4_0) {
+        return dequantize_V_planar4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_ISO4_0) {
+        return dequantize_V_iso4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

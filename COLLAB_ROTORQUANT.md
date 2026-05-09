@@ -3,7 +3,54 @@
 **Branch:** `feature/rotorquant`  
 **GitHub Issue:** Indras-Mirror/llama.cpp-mtp#3  
 **Date:** 2026-05-10  
-**Status:** PLANNING — integration not started  
+**Status:** ✅ ALL TYPES WORKING — all 5 RotorQuant types pass at 4096 context (MTP, FA)  
+**Date:** 2026-05-10 (Session 8+9)
+
+## Test Results (4096 ctx, MTP+FA, Qwen3.6-27B, RTX 4090 sm_89)
+
+| Type | Speed | MTP Drafts | Output | KV Size |
+|------|-------|-----------|--------|---------|
+| TBQ4_0 | 55.3 tok/s | 4/12 (33%) | " Paris." ✅ | 50 MiB |
+| planar3_0 | 53.9 tok/s | 4/12 (33%) | " Paris." ✅ | 50 MiB |
+| iso3_0 | 53.5 tok/s | 4/12 (33%) | " Paris." ✅ | 50 MiB |
+| planar4_0 | 52.2 tok/s | 4/12 (33%) | " Paris." ✅ | 66 MiB |
+| iso4_0 | 50.6 tok/s | 4/12 (33%) | " Paris." ✅ | 66 MiB |
+
+All 3-bit types nearly match TBQ4_0 speed. 4-bit types are ~5-10% slower (expected — larger blocks).
+
+## Test Results (32K ctx, MTP+FA, Qwen3.6-27B, RTX 4090 sm_89)
+
+| Type | Speed | MTP Drafts | Output | Drop from 4K |
+|------|-------|-----------|--------|-------------|
+| TBQ4_0 | 51.5 tok/s | 4/12 (33%) | " Paris." ✅ | -6.9% |
+| planar3_0 | 50.6 tok/s | 4/12 (33%) | " Paris." ✅ | -6.1% |
+| iso3_0 | 50.5 tok/s | 4/12 (33%) | " Paris." ✅ | -5.6% |
+
+Drop from 4K→32K is ~6-7% for both types. Good scaling.
+
+## Bugs Fixed (Session 8-9)
+
+### Bug 1: llama-graph.cpp pass-through crash
+Planar/iso types were included in `k_is_tbq`/`v_is_tbq`, causing wrong tensor dimension routing.
+**Fix:** Reverted to TBQ-only. Added F32 cast block for planar/iso before FA.
+
+### Bug 2: Backend capability routing
+SET_ROWS, GET_ROWS, and CPY `supports_op` didn't include planar/iso types.
+**Fix:** Added PLANAR3_0, ISO3_0, PLANAR4_0, ISO4_0 to all three checks in ggml-cuda.cu.
+
+### Bug 3: Missing 3-bit dequant kernels
+No CUDA kernels for planar3→F32 or iso3→F32 dequant with inverse rotation.
+**Fix:** Wrote `kernel_dequant_planar3_f32` and `kernel_dequant_iso3_f32` in cpy-planar-iso.cu.
+
+### Bug 4: 4-bit dequant without inverse rotation
+Planar4/iso4→F32 re-used `tbq4_dequant_full_cuda` which only unpacks nibbles — no inverse rotation, leaving values in rotated domain.
+**Fix:** Wrote `kernel_dequant_planar4_f32` and `kernel_dequant_iso4_f32` with proper inverse rotation. Updated cpy.cu dispatch.
+
+## Bugs Found & Fixed
+1. **llama-graph.cpp crash**: Planar/iso types in k_is_tbq/v_is_tbq caused ggml_can_mul_mat assertion. Fixed by removing planar/iso from TBQ pass-through (VEC path handles dequant inline).
+2. **planar4_0/iso4_0 garbled output**: Missing dequant kernels with inverse rotation in cpy-planar-iso.cu. Fixed by adding kernel_dequant_planar4_f32 and kernel_dequant_iso4_f32.
+3. **supports_op missing entries**: Added PLANAR3_0/ISO3_0/PLANAR4_0/ISO4_0 to GET_ROWS, SET_ROWS, and CPY cases in ggml-cuda.cu.
+4. **-fit crash**: Memory estimation during auto-fit fails for new types. Workaround: use -fit off.  
 
 ---
 

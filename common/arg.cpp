@@ -313,8 +313,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_TBQ3_0,
     GGML_TYPE_TBQ4_0,
-    GGML_TYPE_TBQP3_0,
-    GGML_TYPE_TBQP4_0,
+    GGML_TYPE_PLANAR3_0,
+    GGML_TYPE_ISO3_0,
+    GGML_TYPE_PLANAR4_0,
+    GGML_TYPE_ISO4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -4769,3 +4771,4 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     //     [](common_params &) { /* unused */ }
     // ).set_preset_only());
 }
+
