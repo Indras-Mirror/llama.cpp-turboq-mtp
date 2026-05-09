@@ -72,15 +72,15 @@ cmake --build build -j$(nproc) --target llama-server
 
 **Option A: Pre-built Native-MTP-Preserved GGUF (Recommended)**
 
-For the Heretic-v2 uncensored model with native MTP heads preserved:
+Use llmfan46's pre-built GGUF with all 15 native MTP heads preserved from Qwen3.6 training:
 
 ```bash
-# Download from HuggingFace (~17 GB, Q4_K_M + MTP heads grafted)
-wget https://huggingface.co/IndrasMirror/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M-GGUF/resolve/main/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf
+# Download from HuggingFace (~17 GB, Q4_K_M, 15 native MTP heads)
+wget https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GGUF/resolve/main/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf
 ```
 
 Model: `Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf`
-Base: HauhauCS Qwen3.6-27B-Heretic-v2 (uncensored), MTP heads grafted via havenoammo's tooling.
+Source: [llmfan46 on HuggingFace](https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GGUF) — Heretic v1.3 MPOA uncensored fine-tune (94% fewer refusals, 0.0021 KL divergence, 85.67% MMLU)
 
 **Option B: Graft MTP heads onto any Qwen3.6 GGUF**
 
@@ -204,7 +204,8 @@ Implemented for `qwen35_mtp` and `qwen35moe_mtp`. Saves 682 MiB with zero qualit
 - **[havenoammo](https://huggingface.co/havenoammo)** — MTP graft tooling, first Qwen3.6-MTP GGUF release
 - **[spiritbuun](https://github.com/spiritbuun)** — dflash fork with CUDA TurboQuant kernels (our FWHT kernels adapted from this)
 - **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — PR #22673 (MTP), PR #21089 (CPU TBQ)
-- **HauhauCS** — Qwen3.6-27B-Heretic-v2 uncensored base model (the specific quant we use: Q4_K_M Native-MTP-Preserved)
+- **llmfan46** — Qwen3.6-27B-Heretic-v2 Native-MTP-Preserved GGUF (the model we use — 15 native MTP heads, MPOA uncensoring)
+- **HauhauCS** — Original Qwen3.6-Heretic-v2 uncensored base model
 - **Radamanthys11** — MTP-Q8_0 GGUF extraction
 - **froggeric** — Fixed chat templates for Qwen3.6 + MTP
 
