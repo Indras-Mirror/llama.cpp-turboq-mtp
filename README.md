@@ -2,7 +2,7 @@
 
 > **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** with fused TurboQuant flash attention — the FA kernel reads raw TBQ4_0 K/V blocks directly from global memory and dequants via centroid lookup in the FWHT-rotated domain. No separate dequant pass, no intermediate F16 buffer.
 
-**82+ tok/s with lossless 4.25 bpv KV cache at 200K context on RTX 4090 24GB.**
+**80-87 tok/s with lossless 4.25 bpv KV cache at 262K context on RTX 4090 24GB.**
 
 ---
 
@@ -15,14 +15,16 @@
 | **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
 
-## Results (RTX 4090 24GB, Qwen3.6-27B Q4_K_M)
+## Results (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M)
 
 | Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
 |--------|---------|----------|-------|-------------|------|
-| **MTP + Fused TBQ4 FA** | **200K** | **TBQ4_0 (4.25 bpv, lossless)** | **82-87** | **73%** | **~20 GB** |
+| **MTP + Fused TBQ4 FA** | **262K** | **TBQ4_0 (4.25 bpv)** | **80-87** | **73-93%** | **~20 GB** |
+| MTP + Fused TBQ4 FA | 200K | TBQ4_0 (4.25 bpv) | 82-87 | 73% | ~20 GB |
 | MTP + Q4_0 KV | 200K | Q4_0 (4.5 bpv) | 92-97 | 93.6% | 23.96 GB |
 | MTP + Q4_0 KV | 135K | Q4_0 (4.5 bpv) | 97-103 | 93.6% | 22.4 GB |
-| Baseline (no MTP, Q4_0) | 200K | Q4_0 | ~40 | - | 23.96 GB |
+| Baseline (no MTP, Q4_0 KV) | 200K | Q4_0 | ~40 | - | 23.96 GB |
+| MTP Draft 5 | 262K | TBQ4_0 | 79.6 avg / 106 peak | 90.1% | ~20 GB |
 
 ## Why This Is Novel
 
@@ -51,14 +53,14 @@ cd llama.cpp-mtp
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build -j$(nproc) --target llama-server
 
-# Fused TBQ4 FA + MTP (82+ tok/s at 200K, lossless 4.25 bpv KV)
+# Fused TBQ4 FA + MTP (80-87 tok/s at 262K, lossless 4.25 bpv KV)
 ./build/bin/llama-server \
   -m your-qwen3.6-mtp.gguf \
   --spec-type mtp --spec-draft-n-max 3 \
-  -ctk tbq4_0 -ctv tbq4_0 -c 200000 -ngl 99 \
+  -ctk tbq4_0 -ctv tbq4_0 -c 262144 -ngl 99 \
   --flash-attn on --mlock -t 8 -ub 32 -np 1 --no-warmup
 
-# Or with Q4_0 KV for max raw speed (92-97 tok/s, uses more VRAM)
+# Or with Q4_0 KV for max raw speed (92-97 tok/s at 200K, uses more VRAM)
 ./build/bin/llama-server \
   -m your-qwen3.6-mtp.gguf \
   --spec-type mtp --spec-draft-n-max 3 \
@@ -67,6 +69,20 @@ cmake --build build -j$(nproc) --target llama-server
 ```
 
 ### Getting an MTP-capable GGUF
+
+**Option A: Pre-built Native-MTP-Preserved GGUF (Recommended)**
+
+For the Heretic-v2 uncensored model with native MTP heads preserved:
+
+```bash
+# Download from HuggingFace (~17 GB, Q4_K_M + MTP heads grafted)
+wget https://huggingface.co/IndrasMirror/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M-GGUF/resolve/main/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf
+```
+
+Model: `Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf`
+Base: HauhauCS Qwen3.6-27B-Heretic-v2 (uncensored), MTP heads grafted via havenoammo's tooling.
+
+**Option B: Graft MTP heads onto any Qwen3.6 GGUF**
 
 Standard GGUF conversion strips MTP layers. Graft them back:
 
@@ -175,17 +191,20 @@ Implemented for `qwen35_mtp` and `qwen35moe_mtp`. Saves 682 MiB with zero qualit
 
 ## Known Issues
 
-- **Vision + MTP** crashes (upstream PR bug, reported 2026-05-06)
-- **nstages=2 pipeline** produces garbled output; reverted to synchronous nstages=0
-- **output.weight sharing** causes 0% draft acceptance (Q4_K != Q6_K quantization error accumulates)
-- **MTP requires `--parallel 1`** (single slot only)
+- **Vision + MTP** crashes (upstream PR bug in multimodal handling — reported 2026-05-06). Use `--spec-type none` for vision tasks.
+- **nstages=2 pipeline** produces garbled output with MTP (non-MTP works at 43.8-45.6 tok/s coherent). Reverted to synchronous nstages=0 for stability.
+- **output.weight sharing** causes 0% draft acceptance (Q4_K ≠ Q6_K quantization error accumulates across embedding layers). `link_shared_tensors()` shares tok_embd only; output gets its own copy.
+- **MTP requires `--parallel 1`** (single slot only — Multi-Token Prediction architecture limitation)
+- **7B models crash with TBQ4** — `nb1=264` is 8-byte aligned, not 16-byte. Deferred. 27B works fine with `nb1=528`.
+- **MoE models (35B-A3B)** may fail with `vector::_M_range_check` in MTP loading if `nextn_predict_layers` metadata is missing or incorrect in the GGUF. Verify `--verbose` output shows the key being read.
+- **MTP draft-n-max 3 vs 5**: Draft 3 gives better per-token speed (80.6 vs 79.6 tok/s) and higher acceptance (92.6% vs 90.1%). Draft 5 occasionally hits higher peaks (106 tok/s) but overhead from verifying longer drafts eats the gain.
 
 ## Credits
 
 - **[havenoammo](https://huggingface.co/havenoammo)** — MTP graft tooling, first Qwen3.6-MTP GGUF release
 - **[spiritbuun](https://github.com/spiritbuun)** — dflash fork with CUDA TurboQuant kernels (our FWHT kernels adapted from this)
 - **[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** — PR #22673 (MTP), PR #21089 (CPU TBQ)
-- **HauhauCS** — Uncensored Qwen3.6 K_P quants
+- **HauhauCS** — Qwen3.6-27B-Heretic-v2 uncensored base model (the specific quant we use: Q4_K_M Native-MTP-Preserved)
 - **Radamanthys11** — MTP-Q8_0 GGUF extraction
 - **froggeric** — Fixed chat templates for Qwen3.6 + MTP
 
