@@ -14,6 +14,62 @@
 | **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673) with 3 draft tokens per forward pass | Working, 73-93% accept |
 | **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
+| **RotorQuant (PlanarQuant + IsoQuant)** | 4 new 3-bit/4-bit KV cache types using Givens/quaternion rotations — faster dequant, better compression, 5.3x faster prefill | ✅ New! |
+
+### RotorQuant — Next-Gen KV Cache Compression
+
+**RotorQuant replaces the FWHT butterfly with block-diagonal 2D/4D rotations.** Same compression ratio as TBQ4 but with O(d) rotation (fully parallel) instead of O(d log d) Hadamard. Drop-in compatible via `-ctk`/`-ctv` flags.
+
+#### Available Types
+
+| Type | Bits | Block | Rotation | VRAM @ 262K |
+|------|------|-------|----------|-------------|
+| `tbq4_0` | 4.25 | 66 bytes/128 dims | FWHT butterfly | 4224 MiB |
+| `planar3_0` | 3.0 | 50 bytes/128 dims | 2D Givens pairs | **3200 MiB** (-24%) |
+| `iso3_0` | 3.0 | 50 bytes/128 dims | 4D quaternion | **3200 MiB** (-24%) |
+| `planar4_0` | 4.0 | 66 bytes/128 dims | 2D Givens pairs | 4224 MiB |
+| `iso4_0` | 4.0 | 66 bytes/128 dims | 4D quaternion | 4224 MiB |
+
+#### Benchmark (RTX 4090, Qwen3.6-27B, MTP+FA)
+
+| Type | 4K ctx | 32K ctx | 262K ctx | Notes |
+|------|--------|---------|----------|-------|
+| `tbq4_0` | 55.3 t/s | 51.5 t/s | 77 t/s | Baseline — fused MMA kernel |
+| `planar3_0` | 53.9 t/s | 50.6 t/s | ~47 t/s | Best speed/compression tradeoff |
+| `iso3_0` | 53.5 t/s | 50.5 t/s | — | Same compression as planar3 |
+| `planar4_0` | 52.2 t/s | — | — | 4-bit Givens |
+| `iso4_0` | 50.6 t/s | — | — | 4-bit quaternion |
+
+#### Usage
+
+```bash
+# Build with FA_ALL_QUANTS for planar/iso support
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build -j$(nproc) --target llama-server
+
+# Use planar3_0 for max VRAM savings (saves 1 GB vs TBQ4 at 262K)
+./build/bin/llama-server \
+  -m your-model.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  -ctk planar3_0 -ctv planar3_0 -c 262144 -ngl 99 \
+  --flash-attn on --mlock -t 8 -ub 32 --parallel 1 --no-warmup
+```
+
+#### How It Works
+
+Unlike TBQ4's FWHT (Hadamard) rotation, RotorQuant uses:
+
+- **PlanarQuant**: 64 independent 2D Givens rotations per 128-dim block. Rotation: `[cos θ, sin θ; -sin θ, cos θ]` per element pair. 128 total rotation parameters.
+- **IsoQuant**: 32 independent 4D quaternion rotations per 128-dim block. 128 total rotation parameters.
+
+Both apply the rotation at quantization time. During FA dequant, the inverse rotation is applied inline — centroid lookup → inverse Givens/quaternion → scale by norm. The rotation is trivially parallel (no sequential stages like FWHT).
+
+#### Bugs Fixed
+
+1. **llama-graph.cpp**: Planar/iso removed from TBQ pass-through — VEC path handles dequant inline
+2. **cpy.cu**: 4-bit dequant kernels with inverse rotation (planar4/iso4→F32)
+3. **ggml-cuda.cu**: `supports_op` entries for all new types
+4. **-fit auto**: Memory estimation workaround with `-fit off`
 
 ## Results (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M)
 
