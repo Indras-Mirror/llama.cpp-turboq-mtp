@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "cpy-planar-iso.cuh"
 #include "tbq4-cuda.cuh"
 #include "tbq3-cuda.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -616,6 +617,22 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         tbq4_dequant_full_cuda(
             (const block_tbq4_0 *)src0_ddc, (float *)src1_ddc,
             ne / QK_TBQ4, main_stream);
+    } else if (src0->type == GGML_TYPE_PLANAR4_0 && src1->type == GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        ggml_cuda_cpy_planar4_f32(src0_ddc, src1_ddc, ne, main_stream);
+    } else if (src0->type == GGML_TYPE_ISO4_0 && src1->type == GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        ggml_cuda_cpy_iso4_f32(src0_ddc, src1_ddc, ne, main_stream);
+    } else if (src0->type == GGML_TYPE_PLANAR3_0 && src1->type == GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        ggml_cuda_cpy_planar3_f32(src0_ddc, src1_ddc, ne, main_stream);
+    } else if (src0->type == GGML_TYPE_ISO3_0 && src1->type == GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        ggml_cuda_cpy_iso3_f32(src0_ddc, src1_ddc, ne, main_stream);
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));

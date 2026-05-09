@@ -209,6 +209,10 @@ add_library(ggml-base
             ggml-turboq.c
             ggml-turboq.h
             ggml-turboq-tables.h
+            ggml-planar-quant.c
+            ggml-planar4-quant.c
+            ggml-iso-quant.c
+            ggml-iso4-quant.c
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES

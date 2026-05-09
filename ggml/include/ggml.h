@@ -432,9 +432,11 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TBQ3_0  = 43, // TurboQuant 3-bit
         GGML_TYPE_TBQ4_0  = 44, // TurboQuant 4-bit
-        GGML_TYPE_TBQP3_0 = 45, // TurboQuant Q_prod 3-bit
-        GGML_TYPE_TBQP4_0 = 46, // TurboQuant Q_prod 4-bit
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_PLANAR3_0 = 45, // PlanarQuant 3-bit: 2D Givens + 2-bit + 1-bit QJL
+        GGML_TYPE_ISO3_0    = 46, // IsoQuant 3-bit: quaternion 4D + 2-bit + 1-bit QJL
+        GGML_TYPE_PLANAR4_0 = 47, // PlanarQuant 4-bit: 2D Givens + 4-bit nibble
+        GGML_TYPE_ISO4_0    = 48, // IsoQuant 4-bit: quaternion 4D + 4-bit nibble
+        GGML_TYPE_COUNT   = 49,
     };
 
     // precision
@@ -481,8 +483,6 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_TBQ3_0  = 29, // except 1d tensors
         GGML_FTYPE_MOSTLY_TBQ4_0  = 30, // except 1d tensors
-        GGML_FTYPE_MOSTLY_TBQP3_0 = 31, // except 1d tensors
-        GGML_FTYPE_MOSTLY_TBQP4_0 = 32, // except 1d tensors
     };
 
     // available tensor operations:
