@@ -1183,6 +1183,14 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         sum_cum += p;
     }
 
+    // Guard against NaN/zero sum (all logits filtered to -infinity by upstream samplers).
+    // Common with MTP speculative decoding where the draft model produces degenerate logits.
+    if (!(sum_cum > 0.0)) {
+        // Fall back to selecting the first token — any choice is valid when all are -inf.
+        cur_p->selected = 0;
+        return;
+    }
+
 #if 1
     // sample from the obtained probabilities and normalize the probs in a single pass
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
