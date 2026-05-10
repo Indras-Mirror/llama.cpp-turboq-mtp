@@ -287,6 +287,30 @@ static void bench(llama_sampler * cnstr, const char * cnstr_name, const std::vec
 
 #define BENCH(__cnstr, __data, __n_iter) bench((__cnstr), #__cnstr, (__data), (__n_iter))
 
+// Test that dist sampler handles all -inf logits (NaN softmax) without crashing.
+// This reproduces the MTP speculative decoding crash where upstream samplers
+// (top_k, top_p, etc.) filter every token to -infinity.
+static void test_dist_all_neg_inf() {
+    const int n_vocab = 256;
+    std::vector<llama_token_data> cur;
+    cur.reserve(n_vocab);
+    for (llama_token i = 0; i < n_vocab; i++) {
+        cur.emplace_back(llama_token_data{i, -INFINITY, 0.0f});
+    }
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+
+    auto * sampler = llama_sampler_init_dist(42);
+    llama_sampler_apply(sampler, &cur_p);
+
+    // After applying dist, selected should be a valid token (0 <= id < n_vocab)
+    // Before the fix, the assert(found) at llama-sampler.cpp:1094 would fire here.
+    printf("dist all -inf selected = %d (n_vocab = %d)\n", cur_p.selected, n_vocab);
+    GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < n_vocab);
+
+    llama_sampler_free(sampler);
+    printf("dist all -inf test PASSED\n");
+}
+
 static void test_perf() {
     const int n_vocab = 1 << 17;
 
@@ -393,6 +417,8 @@ int main(void) {
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
 
     printf("OK\n");
+
+    test_dist_all_neg_inf();
 
     test_perf();
 
