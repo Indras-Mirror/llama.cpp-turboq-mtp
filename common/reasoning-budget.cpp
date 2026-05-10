@@ -177,12 +177,13 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
 
     const llama_token forced = ctx->forced_tokens[ctx->force_pos];
 
-    // set all logits to -inf except the forced token
+    // set all logits to -inf except the forced token.
+    // NOTE: do NOT set the forced token to +INFINITY — downstream
+    // llama_sampler_dist computes exp(+inf)=inf, then inf*0=NaN when
+    // the RNG returns exactly 0.0, causing an assertion failure.
     for (size_t i = 0; i < cur_p->size; i++) {
         if (cur_p->data[i].id != forced) {
             cur_p->data[i].logit = -INFINITY;
-        } else {
-            cur_p->data[i].logit = +INFINITY; // force the token
         }
     }
 }
