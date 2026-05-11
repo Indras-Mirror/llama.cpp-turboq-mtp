@@ -2,7 +2,7 @@
 
 > **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** with fused TurboQuant flash attention — the FA kernel reads raw TBQ4_0 K/V blocks directly from global memory and dequants via centroid lookup in the FWHT-rotated domain. No separate dequant pass, no intermediate F16 buffer.
 
-**80-87 tok/s with lossless 4.25 bpv KV cache at 262K context on RTX 4090 24GB.**
+**80-179 tok/s decode (325 effective) with lossless 4.25 bpv KV cache at 262K context on RTX 4090 24GB.**
 
 ---
 
@@ -71,10 +71,17 @@ Both apply the rotation at quantization time. During FA dequant, the inverse rot
 3. **ggml-cuda.cu**: `supports_op` entries for all new types
 4. **-fit auto**: Memory estimation workaround with `-fit off`
 
+### Recent Fixes (May 11, 2026)
+
+- **NaN sampler crash (#6)**: Guard against all-`-inf` logits in dist sampler — when upstream samplers filter every token to `-infinity`, softmax produces NaN (`-inf - (-inf) = NaN`), causing `assert(found)` failure. Fixed with `!(sum_cum > 0.0)` guard + `test_dist_all_neg_inf` unit test.
+- **Double free**: Upstream cherry-pick from PR #22673 (server-context.cpp lifecycle fix).
+- **RS sequence for MTP only**: Upstream cherry-pick from PR #22673 (fixes partial rollback scope for non-MTP models).
+
 ## Results (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M)
 
 | Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
 |--------|---------|----------|-------|-------------|------|
+| **MTP + Fused TBQ4 FA (May 11)** | **262K** | **TBQ4_0 (4.25 bpv)** | **179.4** | **81.4%** | **~20 GB** |
 | **MTP + Fused TBQ4 FA** | **262K** | **TBQ4_0 (4.25 bpv)** | **80-87** | **73-93%** | **~20 GB** |
 | MTP + Fused TBQ4 FA | 200K | TBQ4_0 (4.25 bpv) | 82-87 | 73% | ~20 GB |
 | MTP + Q4_0 KV | 200K | Q4_0 (4.5 bpv) | 92-97 | 93.6% | 23.96 GB |
