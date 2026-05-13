@@ -44,8 +44,8 @@
 
 ```bash
 # Build with FA_ALL_QUANTS for planar/iso support
-cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j$(nproc) --target llama-server
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build -j$(nproc) --config Release
 
 # Use planar3_0 for max VRAM savings (saves 1 GB vs TBQ4 at 262K)
 ./build/bin/llama-server \
@@ -113,8 +113,8 @@ The key insight: since the Hadamard transform is orthonormal, **attention can op
 ```bash
 git clone https://github.com/Indras-Mirror/llama.cpp-mtp
 cd llama.cpp-mtp
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j$(nproc) --target llama-server
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build -j$(nproc) --config Release
 
 # Fused TBQ4 FA + MTP (80-87 tok/s at 262K, lossless 4.25 bpv KV)
 ./build/bin/llama-server \

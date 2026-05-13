@@ -1029,6 +1029,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #elif !defined(TBQ4_KV_FUSED)
     if constexpr (nstages > 1) {
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
+        // Wait for in-flight cp.async BEFORE __syncthreads() — on Ampere, crossing a
+        // barrier with pending cp.async can cause stale/corrupt shared-memory reads.
+        if constexpr (!is_tbq4_kv) {
+            cp_async_wait_all();
+        }
         __syncthreads();
         if (!last_iter) {
             if constexpr (is_tbq4_kv) {
@@ -1038,8 +1043,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     K_raw + int64_t(k_VKQ_0 + nbatch_fa) * stride_K_bytes,
                     tbq4_staging, stride_K_bytes, k_VKQ_sup);
             } else {
-                cp_async_wait_all();
-                __syncthreads();
                 if (ncols2 > 1 || mask_h) {
                     flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, true, oob_check>
                         (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
