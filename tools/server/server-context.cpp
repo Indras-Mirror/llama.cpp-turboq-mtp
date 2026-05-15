@@ -472,6 +472,9 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
+        // Cap to the user-specified draft max (--spec-draft-n-max)
+        n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
+
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
