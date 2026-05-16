@@ -92,6 +92,26 @@ Both apply the rotation at quantization time. During FA dequant, the inverse rot
 
 **Next sync** will incorporate the upstream MTP implementation while preserving our TBQ4 + RotorQuant + tensor sharing customizations. For now, our MTP implementation is stable and tested (92% draft acceptance, 29-turn continuous session without errors).
 
+### Upstream vs Fork — Head-to-Head (May 17, 2026)
+
+We tested upstream `draft-mtp` (PR #22673, merged May 16) against our custom MTP on identical hardware (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M):
+
+| Metric | Upstream MTP | Our Fork | Delta |
+|--------|:-----------:|:--------:|:-----:|
+| **Generation speed** | 71.5 tok/s | 82-93 tok/s | **+15-30%** |
+| **Draft acceptance** | 47-89% | 73-98% (avg 92%) | **+3-45 pp** |
+| **KV cache type** | Q4_0 (4.5 bpv) | TBQ4_0 (4.25 bpv) | 6% more compression |
+| **Max context @ 24GB** | ~131K | **262K** | **2x** |
+| **262K context VRAM** | ❌ Won't fit (needs 32 GB) | ✅ ~20 GB | — |
+| **Fused quant FA** | ❌ Separate dequant pass | ✅ Inline dequant in FA loop | Memory + speed |
+| **Tensor sharing** | ❌ 682 MiB duplicated | ✅ `link_shared_tensors()` | Saved 682 MiB |
+| **RotorQuant** | ❌ | ✅ planar3/iso3/planar4/iso4 | 3-4 bit KV cache options |
+| **Multi-turn cache** | ✅ Checkpoints (native) | ✅ Checkpoints (our fix) | Same mechanism |
+
+**Why we are not adopting upstream MTP:** Upstream's implementation is a clean starting point, but our fork's TBQ4 fused flash attention + RotorQuant + tensor sharing stack delivers significantly higher performance, 2x the context capacity, and better draft acceptance. Upstream MTP lacks the KV cache compression needed for 262K context on consumer GPUs — the TBQ4_0 format (4.25 bpv) is the critical differentiator, using only 4.2 GB for KV cache vs 16.4 GB for upstream's Q4_0 at 262K.
+
+**Upstream commits assessed (20 total, May 14-17):** Of 40+ commits since our sync point, the vast majority are AMD/Vulkan/WebGPU/Hexagon/SYCL backend changes, CI fixes, web UI updates, and Docker configs — none relevant to our CUDA single-GPU setup. The few potentially useful commits (Qwen3.5 tokenizer improvements, reasoning-budget deep-copy fix, server log reduction) are minor quality-of-life improvements that do not warrant destabilizing our stable build. They will be picked up in the next scheduled sync.
+
 ## Results (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M)
 
 | Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
