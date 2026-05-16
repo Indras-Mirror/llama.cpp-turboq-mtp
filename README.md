@@ -90,7 +90,7 @@ Both apply the rotation at quantization time. During FA dequant, the inverse rot
 
 **Our fork** uses a custom MTP implementation (`--spec-type mtp`, `COMMON_SPECULATIVE_TYPE_MTP`) that predates the upstream merge. Both implementations support Qwen3.6 MTP heads, but ours includes additional features (TBQ4 fused FA, RotorQuant, tensor sharing, context checkpoints for MTP).
 
-**Next sync** will incorporate the upstream MTP implementation while preserving our TBQ4 + RotorQuant + tensor sharing customizations. For now, our MTP implementation is stable and tested (92% draft acceptance, 29-turn continuous session without errors).
+**We are keeping our custom MTP implementation.** Head-to-head testing (see below) shows our fork exceeds upstream in every performance metric. Future upstream syncs will pull non-MTP improvements (tokenizer fixes, server patches, etc.) but our TBQ4 + RotorQuant + tensor sharing + MTP stack will remain the core. This fork is stable and production-tested (92% draft acceptance, 29-turn continuous session without errors, 262K context on 24GB VRAM).
 
 ### Upstream vs Fork — Head-to-Head (May 17, 2026)
 
