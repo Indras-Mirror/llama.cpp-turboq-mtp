@@ -77,6 +77,21 @@ Both apply the rotation at quantization time. During FA dequant, the inverse rot
 - **Double free**: Upstream cherry-pick from PR #22673 (server-context.cpp lifecycle fix).
 - **RS sequence for MTP only**: Upstream cherry-pick from PR #22673 (fixes partial rollback scope for non-MTP models).
 
+### Recent Changes (May 15-17, 2026)
+
+- **Upstream sync**: Merged upstream `ggml-org/llama.cpp` master (`ec562eb67`, 40 commits). Adopted parallel drafting, renamed types (`DRAFT`→`DRAFT_SIMPLE`), `ctx`→`ctx_tgt`/`ctx_dft` split, MTP adapted to new `common_speculative_impl` interface. 6 merge conflicts resolved (README, common/arg.cpp, common/speculative.cpp, tests, server-context.cpp).
+- **MTP draft regression fix**: `n_draft_max` was unconstrained (261K instead of 3), causing batch overflow. `dp.drafting = false` was set too early, preventing `accept()` from updating `last_n_accepted`, feeding stale hidden states to MTP. Both fixed.
+- **Multi-turn KV cache fix**: Context checkpoints were not created for MTP slots because `n_rs_seq=3` fooled `common_context_can_seq_rm` into returning `PART` type. Without checkpoints, every message turn forced full prompt re-processing (~46s per turn). Fixed by enabling context checkpoints for MTP slots (~150 MiB each on CPU RAM, max 32 = ~4.8 GB). Multi-turn latency: 40-50s → ~460ms (86x improvement).
+- **proper-lockfile Bun interop**: Fixed CJS interop edge case where Bun's bundler returns proper-lockfile under a `'.'` key.
+
+## Upstream MTP Status
+
+**⚠️ As of May 16, 2026:** Upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`). This is 20 commits ahead of our current sync point (`ec562eb67`). The upstream implementation uses `--spec-type draft-mtp` and `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`.
+
+**Our fork** uses a custom MTP implementation (`--spec-type mtp`, `COMMON_SPECULATIVE_TYPE_MTP`) that predates the upstream merge. Both implementations support Qwen3.6 MTP heads, but ours includes additional features (TBQ4 fused FA, RotorQuant, tensor sharing, context checkpoints for MTP).
+
+**Next sync** will incorporate the upstream MTP implementation while preserving our TBQ4 + RotorQuant + tensor sharing customizations. For now, our MTP implementation is stable and tested (92% draft acceptance, 29-turn continuous session without errors).
+
 ## Results (RTX 4090 24GB, Qwen3.6-27B-Heretic-v2-MTP Q4_K_M)
 
 | Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
