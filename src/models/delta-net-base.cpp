@@ -225,64 +225,74 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     ggml_tensor * kg_t = ggml_cont(ctx0, ggml_transpose(ctx0, kg));
     cb(kg_t, "key_gdiff_t", il);
 
-    s = ggml_reshape_4d(ctx0, s, S_v, S_v, 1, H_v * n_seqs);
-    cb(s, "dnet_add_ch_state", il);
-
     // [CS, S_v, n_chunks, H_v * n_seqs]
     ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+    cb(v_t, "v_t", il);
 
-    for (int64_t chunk = 0; chunk < n_chunks; chunk++) {
-        ggml_tensor * ch_k_cd    = get_slice_2d(ctx0, k_cd,    chunk); // [S_k,  CS, 1, H_k * n_seqs]
-        ggml_tensor * ch_v_t     = get_slice_2d(ctx0, v_t,     chunk); // [ CS, S_v, 1, H_v * n_seqs]
-        ggml_tensor * ch_kq      = get_slice_2d(ctx0, kq,      chunk); // [ CS,  CS, 1, H_k * n_seqs]
-        ggml_tensor * ch_q_g_exp = get_slice_2d(ctx0, q_g_exp, chunk); // [S_k,  CS, 1, H_k * n_seqs]
-        ggml_tensor * ch_kg_t    = get_slice_2d(ctx0, kg_t,    chunk); // [ CS, S_k, 1, H_v * n_seqs]
+    // Pack kg_t and g_last_exp_t into one tensor for the pipeline op.
+    // kg_t:         [CS,          S_k, n_chunks, H_v * n_seqs]
+    // g_last_exp_t: [1 or S_k, 1,      n_chunks, H_v * n_seqs]
+    // Combined:     [CS + g_extra, S_k, n_chunks, H_v * n_seqs]
+    //   first CS entries along ne[0] = kg_t[j][i]
+    //   last entry (GDA) or last S_k entries (KDA) = g_last_exp_t[i]
+    {
+        const int g_extra = kda ? (int)S_v : 1;
+        const int64_t ne_kgt[] = {CS + g_extra, S_k, n_chunks, H_v * n_seqs};
+        struct ggml_tensor * kg_t_g_last = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+            ne_kgt[0], ne_kgt[1], ne_kgt[2], ne_kgt[3]);
 
-        // [CS, S_v, 1, H_v * n_seqs]
-        ggml_tensor * v_t_p = ggml_mul_mat(ctx0, ch_k_cd, s);
-        cb(v_t_p, "v_prime", il);
+        // Copy kg_t into the first CS entries
+        struct ggml_tensor * v_kg = ggml_view_4d(ctx0, kg_t_g_last,
+            CS, S_k, n_chunks, H_v * n_seqs,
+            ggml_row_size(GGML_TYPE_F32, ne_kgt[0]),
+            ggml_row_size(GGML_TYPE_F32, ne_kgt[0]) * S_k,
+            ggml_row_size(GGML_TYPE_F32, ne_kgt[0]) * S_k * n_chunks,
+            0);
+        ggml_cpy(ctx0, kg_t, v_kg);
 
-        // [CS, S_v, 1, H_v * n_seqs]
-        ggml_tensor * v_t_new = ggml_sub(ctx0, ch_v_t, v_t_p);
-        cb(v_t_new, "v_t_new", il);
+        // Copy g_last into the extra entries
+        struct ggml_tensor * v_g = ggml_view_4d(ctx0, kg_t_g_last,
+            g_extra, S_k, n_chunks, H_v * n_seqs,
+            ggml_row_size(GGML_TYPE_F32, ne_kgt[0]),
+            ggml_row_size(GGML_TYPE_F32, ne_kgt[0]) * S_k,
+            ggml_row_size(GGML_TYPE_F32, ne_kgt[0]) * S_k * n_chunks,
+            ggml_row_size(GGML_TYPE_F32, CS));
 
-        // [S_v, CS, 1, H_v * n_seqs]
-        ggml_tensor * v_attn = ggml_mul_mat(ctx0, v_t_new, ch_kq);
-        cb(v_attn, "v_attn", il);
+        struct ggml_tensor * g_bc = ggml_repeat_4d(ctx0, g_last_exp_t, g_extra, S_k, n_chunks, H_v * n_seqs);
+        ggml_cpy(ctx0, g_bc, v_g);
 
-        // [S_v, CS, 1, H_v * n_seqs]
-        ggml_tensor * attn_inter = ggml_mul_mat(ctx0, s, ch_q_g_exp);
-        cb(attn_inter, "attn_inter", il);
+        cb(kg_t_g_last, "kg_t_g_last", il);
 
-        // [S_v, CS, 1, H_v * n_seqs]
-        ggml_tensor * o_ch = ggml_add(ctx0, attn_inter, v_attn);
-        cb(o_ch, "dnet_add_ch_attn_out", il);
+        // Call the fused pipeline op (replaces the entire sequential chunk loop)
+        ggml_tensor * result = ggml_gated_delta_net_pipe(ctx0,
+            s, k_cd, v_t, kq, q_g_exp, kg_t_g_last,
+            (int) n_tokens, CS, kda);
+        cb(result, "dnet_pipe_result", il);
 
-        v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        // Split result into attention output and final state
+        // result: [S_v * H_v, n_tokens * n_seqs + S_v * n_seqs, 1, 1]
+        //   front: attn_scores [S_v, H_v, n_tokens, n_seqs] row-major
+        //   back:  new_state   [S_v, S_v, H_v, n_seqs] row-major
+        const size_t ne_attn = (size_t) S_v * H_v * n_tokens * n_seqs;
 
-        // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
-        // TODO: head broadcast might not work here - probably will need a transpose
-        ggml_tensor * kgv = ggml_mul_mat(ctx0, ch_kg_t, v_t_new); // [S_k, S_v, 1, H_k * n_seqs]
+        struct ggml_tensor * o = ggml_view_4d(ctx0, result,
+            S_v, H_v, n_tokens, n_seqs,
+            sizeof(float) * S_v,
+            sizeof(float) * S_v * H_v,
+            sizeof(float) * S_v * H_v * n_tokens,
+            0);
+        cb(o, "output", il);
 
-        // last_recurrent_state = last_recurrent_state * g_last + kgdmulvnew
-        ggml_tensor * ch_g_last_exp_t = get_slice_2d(ctx0, g_last_exp_t, chunk);
+        s = ggml_view_4d(ctx0, result,
+            S_v, S_v, H_v, n_seqs,
+            sizeof(float) * S_v,
+            sizeof(float) * S_v * S_v,
+            sizeof(float) * S_v * S_v * H_v,
+            ne_attn * sizeof(float));
+        cb(s, "output_state", il);
 
-        s = ggml_mul(ctx0, s, ch_g_last_exp_t);
-        s = ggml_add(ctx0, s, kgv);
-        cb(s, "dnet_add_ch_state", il);
+        return {o, s};
     }
-
-    // truncate padded tokens
-    ggml_tensor * o = ggml_view_4d(ctx0, v,
-            S_v, n_tokens, H_v, n_seqs,
-            ggml_row_size(v->type, S_v),
-            ggml_row_size(v->type, S_v * CS * n_chunks),
-            ggml_row_size(v->type, S_v * CS * n_chunks * H_v), 0);
-    o = ggml_permute  (ctx0, o, 0, 2, 1, 3); // [S_v, H_v, n_tokens, n_seqs]
-    s = ggml_reshape_4d(ctx0, s, S_v, S_v, H_v, n_seqs);
-    cb(s, "output_state", il);
-
-    return {o, s};
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_autoregressive(
