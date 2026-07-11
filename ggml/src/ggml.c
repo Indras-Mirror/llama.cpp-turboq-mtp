@@ -1128,7 +1128,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,6 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "gated_delta_net_pipe(state, k_cd, v_t, kq, q_g_exp, kg_t)",
 
     "unary(x)",
 
@@ -1238,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6277,6 +6278,65 @@ struct ggml_tensor * ggml_gated_delta_net(
 
     int32_t flag = keep_intermediates ? 1 : 0;
     ggml_set_op_params(result, &flag, sizeof(flag));
+
+    return result;
+}
+
+// ggml_gated_delta_net_pipe
+
+struct ggml_tensor * ggml_gated_delta_net_pipe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * k_cd,
+        struct ggml_tensor  * v_t,
+        struct ggml_tensor  * kq,
+        struct ggml_tensor  * q_g_exp,
+        struct ggml_tensor  * kg_t,
+        int                   n_tokens,
+        int                   CS,
+        bool                  kda) {
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_cd->type  == GGML_TYPE_F32);
+    GGML_ASSERT(v_t->type   == GGML_TYPE_F32);
+    GGML_ASSERT(kq->type    == GGML_TYPE_F32);
+    GGML_ASSERT(q_g_exp->type == GGML_TYPE_F32);
+    GGML_ASSERT(kg_t->type  == GGML_TYPE_F32);
+
+    const int64_t S_v = state->ne[0];
+    const int64_t H_v = state->ne[2];
+    const int64_t n_seqs = state->ne[3];
+
+    GGML_ASSERT(S_v == state->ne[1]); // square state matrix
+
+    const int64_t n_chunks = k_cd->ne[2];
+
+    GGML_ASSERT(k_cd->ne[0]  == S_v);
+    GGML_ASSERT(k_cd->ne[1]  == CS);
+    GGML_ASSERT(v_t->ne[0]   == CS);
+    GGML_ASSERT(v_t->ne[1]   == S_v);
+    GGML_ASSERT(v_t->ne[2]   == n_chunks);
+    GGML_ASSERT(kq->ne[0]    == CS);
+    GGML_ASSERT(kq->ne[1]    == CS);
+    GGML_ASSERT(kq->ne[2]    == n_chunks);
+    GGML_ASSERT(q_g_exp->ne[0] == S_v);
+    GGML_ASSERT(q_g_exp->ne[1] == CS);
+    GGML_ASSERT(q_g_exp->ne[2] == n_chunks);
+
+    // output: attention scores + final state
+    // [S_v, H_v, n_tokens, n_seqs] + [S_v, S_v, H_v, n_seqs]
+    const int64_t ne[4] = { S_v * H_v, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_PIPE;
+    result->src[0] = state;
+    result->src[1] = k_cd;
+    result->src[2] = v_t;
+    result->src[3] = kq;
+    result->src[4] = q_g_exp;
+    result->src[5] = kg_t;
+
+    int32_t params[3] = { n_tokens, CS, kda ? 1 : 0 };
+    ggml_set_op_params(result, &params, sizeof(params));
 
     return result;
 }
