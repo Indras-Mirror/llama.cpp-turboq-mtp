@@ -1093,7 +1093,8 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* n_ctx                 */ params_base.n_ctx
             };
         }
 
@@ -2487,6 +2488,17 @@ private:
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
                                                          slot.task->n_tokens(), slot.n_ctx),
+                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                slot.release();
+                                continue;
+                            }
+
+                            // also check that the accumulated context has room
+                            if (slot.prompt.tokens.pos_next() >= slot.n_ctx) {
+                                send_error(slot,
+                                           string_format("accumulated context (%d tokens) is full — cannot process "
+                                                         "more tokens (max %d)",
+                                                         (int)slot.prompt.tokens.pos_next(), slot.n_ctx),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 continue;

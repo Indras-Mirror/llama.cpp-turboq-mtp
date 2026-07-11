@@ -480,8 +480,14 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 LOG_WRN("%s: missing source tensor at k=%d; stopping chain\n", __func__, k);
                 return;
             }
-            ggml_backend_tensor_get(src, batch.embd,
-                                    (size_t) src_row * row_bytes, row_bytes);
+            const size_t offset = (size_t) src_row * row_bytes;
+            if (offset + row_bytes > ggml_nbytes(src)) {
+                LOG_WRN("%s: tensor out of bounds at k=%d (row=%d, nbytes=%zu); "
+                        "context may be full — stopping MTP chain\n",
+                        __func__, k, src_row, ggml_nbytes(src));
+                return;
+            }
+            ggml_backend_tensor_get(src, batch.embd, offset, row_bytes);
 
             batch.token[0] = cond_tok;
             batch.pos[0]   = pos;
