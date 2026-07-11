@@ -296,6 +296,7 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    int  n_ctx = 262144; // slot context window (used for prompt trimming)
 };
 
 // used by /completions endpoint

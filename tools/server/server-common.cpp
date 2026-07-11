@@ -1101,6 +1101,90 @@ json oaicompat_chat_params_parse(
     }
     inputs.force_pure_content = opt.force_pure_content;
 
+    // ──── PROMPT TRIMMING ────
+    // Trim from the TOP of the conversation (after system prompt) when over budget.
+    // Keeps: system prompt + the most recent N messages that fit within n_ctx - margin.
+    // Drops: old history messages from the top of the conversation.
+    // No middle gaps — system prompt transitions directly to the oldest kept message.
+    // This ensures the rendered prompt shares a long prefix with the cached KV
+    // so n_past is large, checkpoints can be restored, and only the delta
+    // (new tokens) gets processed instead of a full prefill reload.
+    {
+        const size_t margin = std::max<int>(
+            opt.reasoning_budget + 4096,   // reasoning budget + tool calls/output
+            8192);                          // minimum safe margin
+        const size_t budget = std::max<size_t>(1, opt.n_ctx) - margin;
+
+        auto estimate_msg_tokens = [](const common_chat_msg & msg) -> size_t {
+            size_t chars = 0;
+            chars += msg.content.size();
+            chars += msg.reasoning_content.size();
+            for (const auto & part : msg.content_parts) {
+                chars += part.text.size();
+            }
+            // Template overhead: ~5 tokens per message for markers + role text
+            // Content: ~3 chars per token (conservative estimate)
+            return chars / 3 + 5;
+        };
+
+        size_t total = 0;
+        for (const auto & msg : inputs.messages) {
+            total += estimate_msg_tokens(msg);
+        }
+
+        if (total > budget) {
+            // Find system prompt (usually the first message, role="system")
+            int sys_idx = -1;
+            for (int i = 0; i < (int)inputs.messages.size(); i++) {
+                if (inputs.messages[i].role == "system") {
+                    sys_idx = i;
+                    break;
+                }
+            }
+
+            // Per-message estimates
+            std::vector<size_t> msg_tokens(inputs.messages.size());
+            for (int i = 0; i < (int)inputs.messages.size(); i++) {
+                msg_tokens[i] = estimate_msg_tokens(inputs.messages[i]);
+            }
+
+            // Walk backwards from the last message to find how many recent ones fit.
+            // Everything before the first kept recent message gets dropped (trim from top).
+            size_t sys_cost    = (sys_idx >= 0) ? msg_tokens[sys_idx] : 0;
+            size_t recent_cost = 0;
+            int first_kept     = (int)inputs.messages.size(); // index of first kept message
+
+            for (int i = (int)inputs.messages.size() - 1; i >= 0; i--) {
+                if (i == sys_idx) continue;
+                if (sys_cost + recent_cost + msg_tokens[i] > budget) break;
+                recent_cost += msg_tokens[i];
+                first_kept = i;
+            }
+
+            // Rebuild if we need to drop anything (messages between sys and first_kept)
+            if (first_kept > (sys_idx >= 0 ? sys_idx + 1 : 0)) {
+                std::vector<common_chat_msg> trimmed;
+                if (sys_idx >= 0) {
+                    trimmed.push_back(inputs.messages[sys_idx]);           // keep system prompt
+                }
+                for (int i = first_kept; i < (int)inputs.messages.size(); i++) {
+                    if (i == sys_idx) continue;
+                    trimmed.push_back(inputs.messages[i]);                // keep recent messages
+                }
+
+                int kept    = (int)trimmed.size();
+                int dropped = (int)inputs.messages.size() - kept;
+                SRV_INF("trimmed prompt: %d messages -> %d (dropped %d old history messages), "
+                        "est. %zu tokens -> %zu tokens\n",
+                        (int)inputs.messages.size(), kept, dropped,
+                        total, sys_cost + recent_cost);
+
+                inputs.messages = std::move(trimmed);
+            }
+        }
+    }
+    // ──── END TRIMMING ────
+
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
 
