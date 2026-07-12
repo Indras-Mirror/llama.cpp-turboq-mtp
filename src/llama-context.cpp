@@ -17,6 +17,23 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+#ifdef GGML_USE_CUDA
+#define CUDA_CHECK(x)                                                                      \
+    do {                                                                                   \
+        cudaError_t _e = (x);                                                              \
+        if (_e != cudaSuccess) {                                                           \
+            LLAMA_LOG_ERROR("%s: CUDA error %s (%s:%d)\n", #x, cudaGetErrorString(_e),     \
+                            __FILE__, __LINE__);                                           \
+        }                                                                                  \
+    } while (0)
+#else
+#define CUDA_CHECK(x) (void)(x)
+#endif
+
 //
 // llama_context
 //
@@ -2325,6 +2342,71 @@ private:
     std::vector<write_info> winfos;
 };
 
+// Async variant: issues device->host copies on cudaStreamPerThread (a stream
+// separate from the compute stream) so they overlap with subsequent compute.
+// The destination buffer MUST be pinned host memory. The caller is responsible
+// for synchronizing the returned event before consuming the data.
+// NOTE: RTX-4090 / NVIDIA-dedicated fork optimization.
+class llama_io_write_host_async : public llama_io_write_i {
+public:
+    llama_io_write_host_async(
+            uint8_t * p, size_t len, ggml_backend_sched_t sched) : ptr(p), buf_size(len), sched(sched) {}
+
+    ~llama_io_write_host_async() {
+#ifdef GGML_USE_CUDA
+        for (const auto & winfo : winfos) {
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, winfo.tensor);
+            ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        }
+#else
+        for (const auto & winfo : winfos) {
+            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        }
+#endif
+    }
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        winfos.push_back({tensor, ptr, size, offset});
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+
+    ggml_backend_sched_t sched;
+
+    struct write_info {
+        ggml_tensor * tensor;
+        uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<write_info> winfos;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
@@ -2710,6 +2792,35 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, void * cuda_event_out) {
+#ifdef GGML_USE_CUDA
+    // Ensure the state is fully computed before issuing the async copies.
+    synchronize();
+
+    llama_io_write_host_async io(dst, size, get_sched());
+
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        state_seq_write_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+
+    cudaEvent_t ev;
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(ev, cudaStreamPerThread));
+
+    *(cudaEvent_t *) cuda_event_out = ev;
+    return size;
+#else
+    (void) cuda_event_out;
+    return state_seq_get_data(seq_id, dst, size, flags);
+#endif
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
@@ -3885,6 +3996,32 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
+}
+
+// RTX-4090 / NVIDIA-dedicated: async checkpoint capture.
+// Copies the sequence state into a PINNED host buffer on cudaStreamPerThread so
+// the transfer overlaps with subsequent prefill compute. `dst` must be pinned.
+// The event handle is written to *cuda_event_out (caller synchronizes it via
+// llama_state_seq_capture_wait before consuming the data). Falls back to the
+// synchronous path when CUDA is unavailable.
+size_t llama_state_seq_get_data_ext_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, void * cuda_event_out) {
+#ifdef GGML_USE_CUDA
+    return ctx->state_seq_get_data_async(seq_id, dst, size, flags, cuda_event_out);
+#else
+    (void) cuda_event_out;
+    return llama_state_seq_get_data_ext(ctx, dst, size, seq_id, flags);
+#endif
+}
+
+// RTX-4090 / NVIDIA-dedicated: wait for an async checkpoint capture to finish.
+void llama_state_seq_capture_wait(llama_context * /*ctx*/, void * cuda_event) {
+#ifdef GGML_USE_CUDA
+    cudaEvent_t ev = *(cudaEvent_t *) cuda_event;
+    CUDA_CHECK(cudaEventSynchronize(ev));
+    CUDA_CHECK(cudaEventDestroy(ev));
+#else
+    (void) cuda_event;
+#endif
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();

@@ -484,6 +484,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     }
 
     if (cparams.fused_gdn_ch) {
+        // Use build_delta_net_fused for the built-in fused kernel.
+        // To test the pipeline op: set --no-fused-gdn-ch
         return build_delta_net_fused(q, k, v, g, b, s, il);
     }
 

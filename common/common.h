@@ -10,6 +10,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <atomic>
 #include <string_view>
 #include <vector>
 #include <map>
@@ -300,6 +301,8 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
+
+    bool   adapt = false; // Proposal B: adaptively throttle draft depth on low acceptance
 
     float p_split = 0.1f;  // speculative decoding split probability
     float p_min   = 0.75f; // minimum speculative decoding probability (greedy)
@@ -1039,6 +1042,36 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+
+    common_prompt_checkpoint() = default;
+    ~common_prompt_checkpoint();
+
+    // async capture state holds CUDA resources; transfer ownership on move so the
+    // source no longer frees them. Moves only ever happen before any capture is
+    // in flight (slot vector growth at startup), so the callback pointers stay valid.
+    common_prompt_checkpoint(common_prompt_checkpoint && o) noexcept;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint && o) noexcept;
+
+    // Copies happen at prompt setup, always with an inactive capture, so copying
+    // the plain data and leaving async state at defaults is correct.
+    common_prompt_checkpoint(const common_prompt_checkpoint & o);
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & o);
+
+#ifdef GGML_USE_CUDA
+    // RTX-4090 / NVIDIA-dedicated: async checkpoint capture state.
+    // The state is captured with llama_state_seq_get_data_ext_async into a pinned
+    // staging buffer; a CUDA host callback then copies it into data_tgt/data_dft
+    // (pageable) and releases the staging slot. `copied_*` starts true so the
+    // non-async fallback path (and already-finished captures) need no waiting.
+    void *            cuda_event_tgt  = nullptr;
+    void *            cuda_event_dft  = nullptr;
+    int               staging_slot_tgt = -1;
+    int               staging_slot_dft = -1;
+    std::atomic<bool> copied_tgt{true};
+    std::atomic<bool> copied_dft{true};
+    bool              async_active_tgt = false;
+    bool              async_active_dft = false;
+#endif
 
     size_t size() const;
 

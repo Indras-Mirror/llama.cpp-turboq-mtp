@@ -376,13 +376,29 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     uint16_t last_n_drafted  = 0;
     int32_t  last_n_accepted = -1;
 
+    // Proposal B: adaptive draft-depth back-pressure
+    bool    adapt_enabled = false;
+    int32_t n_min_cfg     = 1;
+    int32_t n_max_cfg     = 3;
+    float   ema_acc       = -1.0f;   // EMA of per-step acceptance ratio
+    int32_t n_eff         = 3;       // current effective draft depth
+    static constexpr float ADAPT_ALPHA = 0.25f;
+    static constexpr float ADAPT_LO    = 0.35f;  // sustained acceptance below -> drop to n_min
+    static constexpr float ADAPT_HI    = 0.50f;  // sustained acceptance above -> full n_max
+
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
-                                 llama_context * ctx_mtp)
+                                 llama_context * ctx_mtp,
+                                 const common_params_speculative & sparams = common_params_speculative())
         : common_speculative_impl(type, /*n_seq=*/ 1), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
         GGML_ASSERT(ctx_tgt && ctx_mtp);
         const llama_model * model_mtp = llama_get_model(ctx_mtp);
         n_embd = llama_model_n_embd(model_mtp);
+
+        adapt_enabled = sparams.draft.adapt;
+        n_min_cfg     = sparams.draft.n_min > 0 ? sparams.draft.n_min : 1;
+        n_max_cfg     = std::max(1, sparams.draft.n_max);
+        n_eff         = n_max_cfg;
 
         {
             common_params_sampling sparams;
@@ -439,7 +455,9 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         auto & dp = dparams[0];
         if (!dp.drafting) return;
 
-        const int32_t n_max     = std::max(1, dp.n_max > 0 ? dp.n_max : 3);
+        const int32_t n_max_req = std::max(1, dp.n_max > 0 ? dp.n_max : 3);
+        const int32_t n_max     = adapt_enabled ? std::max(1, std::min(n_max_req, n_eff)) : n_max_req;
+        dp.n_max = n_max;   // keep upstream truncation in sync with adapted depth
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
 
         // clean up previous draft if not accepted
@@ -513,6 +531,18 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
         const int32_t n_drafted_last = (int32_t) last_n_drafted;
+        if (adapt_enabled && n_drafted_last > 0) {
+            const float inst = (float) n_accepted / (float) n_drafted_last;
+            ema_acc = (ema_acc < 0.0f) ? inst : (ADAPT_ALPHA * inst + (1.0f - ADAPT_ALPHA) * ema_acc);
+            if (ema_acc < ADAPT_LO) {
+                if (n_eff != n_min_cfg) { LOG_INF("%s: spec-adapt: acceptance low (ema=%.2f) -> draft depth %d\n", __func__, ema_acc, n_min_cfg); }
+                n_eff = n_min_cfg;
+            } else if (ema_acc > ADAPT_HI) {
+                if (n_eff != n_max_cfg) { LOG_INF("%s: spec-adapt: acceptance recovered (ema=%.2f) -> draft depth %d\n", __func__, ema_acc, n_max_cfg); }
+                n_eff = n_max_cfg;
+            }
+            // else: hold current n_eff (hysteresis band)
+        }
         const int32_t n_to_drop = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
         if (pos_max < 0) {
             last_n_accepted = (int32_t) n_accepted;
@@ -1120,7 +1150,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {
                 impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                    config.type, params.draft.ctx_tgt, ctx_mtp));
+                    config.type, params.draft.ctx_tgt, ctx_mtp, config.params));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

@@ -4,6 +4,15 @@
 
 **80-179 tok/s decode (325 effective) with lossless 4.25 bpv KV cache at 262K context on RTX 4090 24GB.**
 
+> ## ⚠️ NVIDIA / RTX-4090-Dedicated Fork
+>
+> This is a **separate, NVIDIA-only fork**. It assumes a single **NVIDIA RTX 4090 (Ada Lovelace, sm_89)** with CUDA and makes no attempt at portability to CPU, ROCm, Metal, or other vendors:
+> - Async checkpoint capture relies on **pinned host memory, CUDA streams, and `cudaLaunchHostFunc`** (`cudaStreamPerThread`); non-CUDA builds fall back to the synchronous path.
+> - KV-cache and attention kernels target **TurboQuant TBQ4 / RotorQuant** layouts and the fused Flash-Attention path.
+> - Optimizations (Tensor-Core matmul, fused DeltaNet, MTP) are tuned for one RTX 4090 with 24 GiB VRAM and a 262K-context, lossless-KV workload.
+>
+> We do **not** intend to upstream these changes to mainline llama.cpp.
+
 ---
 
 ## What This Fork Adds
@@ -11,10 +20,43 @@
 | Feature | Description | Status |
 |---------|-------------|--------|
 | **Fused TBQ4 Flash Attention** | Quantized-KV dequant inside the FA inner loop via rotated-domain attention | Working, 82+ tok/s |
-| **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673) with 3 draft tokens per forward pass | Working, 73-93% accept |
+| **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673) with 3 draft tokens per forward pass | Working, 50–68% accept (head-quality limited; see [PROPOSAL](PROPOSAL-mtp-acceptance.md)) |
 | **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
 | **RotorQuant (PlanarQuant + IsoQuant)** | 4 new 3-bit/4-bit KV cache types using Givens/quaternion rotations — faster dequant, better compression, 5.3x faster prefill | ✅ New! |
+| **Async Checkpoint Capture** | Prompt checkpoints captured via async D2H into a pinned staging ring (≤2 slots, ~300 MiB pinned) so the 32× ~149 MiB state readbacks overlap with prefill compute instead of stalling it | ✅ New! |
+| **KV Pad Floor** | Configurable via `LLAMA_KV_PAD_MIN` env (default 4096); 16× fewer graph re-captures than upstream hardcoded 256 | Working |
+| **Adaptive Draft Depth** | `--spec-adapt` throttles MTP draft depth on pathologically low acceptance (<35%); guards against wasted compute during dips | Working |
+| **P-Core Binding** | Architecture proposal for pinning hot main thread to dedicated P-core on i9-12900K; see [ARCHITECTURE](ARCHITECTURE-pcore-binding.md) | Proposed |
+
+### Documentation / Proposals
+
+| Document | Purpose |
+|----------|---------|
+| [PROPOSAL-mtp-acceptance.md](PROPOSAL-mtp-acceptance.md) | Root-cause analysis of 50% acceptance gap + four ranked levers (temp, adaptive depth, EAGLE3, FastMTP) |
+| [FASTMTP-RETRAIN.md](FASTMTP-RETRAIN.md) | Handoff for model owner: retrain MTP head with FastMTP objective (+82% accept) |
+| [ARCHITECTURE-pcore-binding.md](ARCHITECTURE-pcore-binding.md) | P-core affinity + OpenMP isolation for single-threaded ggml build path |
+| [CHANGES-UNCOMMITTED.md](CHANGES-UNCOMMITTED.md) | Revert guide for all local changes |
+
+### Target Audience & Production Configuration
+
+This fork is tuned for **Qwopus3.6-27B-v2-MTP** (or compatible Qwen3.5 27B) on a **single RTX 4090 (24 GiB)** at **262K context** with **lossless TBQ4 KV cache**.
+
+The production server (`llama-turboq.service`) runs:
+
+```
+--temp 0.6 --top-p 0.95 --min-p 0.05     # fixes agent tool-call loops, raises decode 62→82 tok/s (+31%)
+--reasoning on --reasoning-budget 8192    # thinking tokens inside <think> tags
+--jinja                                    # model's native Qwen3.5 chat template
+--spec-type mtp --spec-draft-n-max 3      # MTP speculative decoding
+--spec-adapt                              # adaptive draft-depth guard
+-ctk tbq4_0 -ctv tbq4_0                  # TBQ4 lossless KV (4.25 bpv, ~4 GiB @ 262K)
+--flash-attn on                           # fused dequant + FA kernel
+-c 262144 -ngl 99                         # full context, all layers on GPU
+```
+
+Current decode throughput at 262K context: **~82 tok/s** (temp 0.6, MTP 3 drafts).
+The remaining throughput headroom (target: 70–95% MTP acceptance) requires model-side retraining — see [FASTMTP-RETRAIN.md](FASTMTP-RETRAIN.md).
 
 ### RotorQuant — Next-Gen KV Cache Compression
 
@@ -83,6 +125,26 @@ Both apply the rotation at quantization time. During FA dequant, the inverse rot
 - **MTP draft regression fix**: `n_draft_max` was unconstrained (261K instead of 3), causing batch overflow. `dp.drafting = false` was set too early, preventing `accept()` from updating `last_n_accepted`, feeding stale hidden states to MTP. Both fixed.
 - **Multi-turn KV cache fix**: Context checkpoints were not created for MTP slots because `n_rs_seq=3` fooled `common_context_can_seq_rm` into returning `PART` type. Without checkpoints, every message turn forced full prompt re-processing (~46s per turn). Fixed by enabling context checkpoints for MTP slots (~150 MiB each on CPU RAM, max 32 = ~4.8 GB). Multi-turn latency: 40-50s → ~460ms (86x improvement).
 - **proper-lockfile Bun interop**: Fixed CJS interop edge case where Bun's bundler returns proper-lockfile under a `'.'` key.
+
+### Recent Changes (Jul 12, 2026)
+
+- **Async checkpoint capture (RTX-4090 / NVIDIA-dedicated)**: Prompt checkpoints (32 × ~149 MiB state readbacks during a 262K prefill) previously stalled the prefill compute stream — `llama_state_seq_get_data_ext` did a full `ctx->synchronize()` plus one blocking `ggml_backend_tensor_get` per state tensor. Now capture is **asynchronous**: the state is copied device→host into a **pinned staging ring** (2 slots, ~300 MiB pinned RAM max) on `cudaStreamPerThread`, overlapping with subsequent prefill compute. A CUDA host callback (`cudaLaunchHostFunc`) copies staging→pageable store and frees the slot within milliseconds, so pinned RAM never exceeds ~300 MiB regardless of checkpoint count. The data is only synchronized (event wait) when a checkpoint is actually *consumed* (cache reuse), where the GPU is idle. Non-CUDA builds fall back to the synchronous path. Verified: checkpoint create + restore work correctly end-to-end.
+
+### Async Checkpoint Capture — Design
+
+```
+create_checkpoint (prefill loop, no stall)
+   └─ update_tgt/update_dft
+        ├─ llama_state_seq_get_data_ext_async  → async D2H into pinned staging (cudaStreamPerThread)
+        └─ cudaLaunchHostFunc(cb): staging → pageable data_tgt/data_dft, release staging slot
+
+follow-up request (GPU idle)
+   └─ load_tgt/load_dft
+        └─ if async still in flight: cudaStreamSynchronize(cudaStreamPerThread)  // cheap, GPU idle
+        └─ llama_state_seq_set_data_ext  (restore)
+```
+
+Pinned RAM is bounded to a 2-slot ring (`ckpt_staging_pool` in `common/common.cpp`) because the RTX 4090 host has little headroom — we deliberately avoid pinning all 32 checkpoints (~4.7 GB).
 
 ## Upstream MTP Status
 

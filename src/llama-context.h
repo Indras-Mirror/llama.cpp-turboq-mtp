@@ -152,6 +152,11 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+
+    // RTX-4090 / NVIDIA-dedicated: async state capture into a pinned host buffer.
+    // Returns size written; records a CUDA event (written to *cuda_event_out) that
+    // the caller must synchronize before consuming the data.
+    size_t state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, void * cuda_event_out);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(

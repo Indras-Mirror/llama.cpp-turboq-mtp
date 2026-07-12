@@ -18,6 +18,11 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <mutex>
+
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -1972,6 +1977,74 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+#ifdef GGML_USE_CUDA
+// RTX-4090 / NVIDIA-dedicated: small rotating pool of PINNED host buffers used as
+// staging for async checkpoint D2H copies. Bounded to N slots (~2x max checkpoint
+// size) so pinned (locked) RAM stays tiny; the CUDA host callback releases a slot
+// as soon as its copy finishes (~ms), long before the next checkpoint is created.
+namespace {
+
+struct ckpt_staging_pool {
+    static constexpr int N = 2;
+
+    uint8_t * buf[N]  = {nullptr};
+    size_t    cap[N]  = {0};
+    bool      busy[N] = {false};
+    std::mutex mtx;
+
+    int acquire(size_t need) {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (int i = 0; i < N; ++i) {
+            if (!busy[i]) {
+                if (cap[i] < need) {
+                    if (buf[i]) {
+                        cudaFreeHost(buf[i]);
+                    }
+                    cudaHostAlloc((void **)&buf[i], need, cudaHostAllocDefault);
+                    cap[i] = need;
+                }
+                busy[i] = true;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void release(int i) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (i >= 0 && i < N) {
+            busy[i] = false;
+        }
+    }
+
+    uint8_t * ptr(int i) { return (i >= 0 && i < N) ? buf[i] : nullptr; }
+};
+
+ckpt_staging_pool g_ckpt_staging;
+
+struct ckpt_cb_data {
+    uint8_t *          dst;    // data_tgt/data_dft (stable: checkpoint lives in a std::list)
+    size_t             size;
+    int                slot;
+    std::atomic<bool> *copied;
+};
+
+void ckpt_host_cb(void * p) {
+    auto * d = static_cast<ckpt_cb_data *>(p);
+    uint8_t * staging = g_ckpt_staging.ptr(d->slot);
+    if (staging && d->dst) {
+        memcpy(d->dst, staging, d->size);
+    }
+    if (d->copied) {
+        d->copied->store(true, std::memory_order_release);
+    }
+    g_ckpt_staging.release(d->slot);
+    delete d;
+}
+
+} // namespace
+#endif
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size();
 }
@@ -1981,6 +2054,29 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
+#ifdef GGML_USE_CUDA
+    if (async_active_tgt && !copied_tgt.load()) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    if (async_active_dft && !copied_dft.load()) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    if (async_active_tgt && cuda_event_tgt) {
+        cudaEventDestroy((cudaEvent_t) cuda_event_tgt);
+    }
+    if (async_active_dft && cuda_event_dft) {
+        cudaEventDestroy((cudaEvent_t) cuda_event_dft);
+    }
+    async_active_tgt   = false;
+    async_active_dft   = false;
+    cuda_event_tgt     = nullptr;
+    cuda_event_dft     = nullptr;
+    staging_slot_tgt   = -1;
+    staging_slot_dft   = -1;
+    copied_tgt.store(true);
+    copied_dft.store(true);
+#endif
+
     n_tokens = 0;
 
     pos_min = 0;
@@ -1988,6 +2084,119 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
+}
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+#ifdef GGML_USE_CUDA
+    // wait for any in-flight async capture callback, then free the CUDA event
+    if (async_active_tgt && !copied_tgt.load()) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    if (async_active_dft && !copied_dft.load()) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    if (async_active_tgt && cuda_event_tgt) {
+        cudaEventDestroy((cudaEvent_t) cuda_event_tgt);
+    }
+    if (async_active_dft && cuda_event_dft) {
+        cudaEventDestroy((cudaEvent_t) cuda_event_dft);
+    }
+    // staging slots are released by the host callback; if it is somehow still
+    // pending, the stream sync above guarantees it has run by now.
+#endif
+}
+
+common_prompt_checkpoint::common_prompt_checkpoint(common_prompt_checkpoint && o) noexcept
+    : n_tokens(o.n_tokens),
+      pos_min(o.pos_min),
+      pos_max(o.pos_max),
+      data_tgt(std::move(o.data_tgt)),
+      data_dft(std::move(o.data_dft))
+#ifdef GGML_USE_CUDA
+      , cuda_event_tgt(o.cuda_event_tgt)
+      , cuda_event_dft(o.cuda_event_dft)
+      , staging_slot_tgt(o.staging_slot_tgt)
+      , staging_slot_dft(o.staging_slot_dft)
+      , copied_tgt(o.copied_tgt.load())
+      , copied_dft(o.copied_dft.load())
+      , async_active_tgt(o.async_active_tgt)
+      , async_active_dft(o.async_active_dft)
+#endif
+{
+#ifdef GGML_USE_CUDA
+    // take ownership; clear source so its destructor leaves our resources alone
+    o.cuda_event_tgt   = nullptr;
+    o.cuda_event_dft   = nullptr;
+    o.staging_slot_tgt = -1;
+    o.staging_slot_dft = -1;
+    o.async_active_tgt = false;
+    o.async_active_dft = false;
+    o.copied_tgt.store(true);
+    o.copied_dft.store(true);
+#endif
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_checkpoint && o) noexcept {
+    if (this != &o) {
+        // free any resources we currently own
+        this->clear();
+
+        n_tokens = o.n_tokens;
+        pos_min  = o.pos_min;
+        pos_max  = o.pos_max;
+        data_tgt = std::move(o.data_tgt);
+        data_dft = std::move(o.data_dft);
+
+#ifdef GGML_USE_CUDA
+        cuda_event_tgt   = o.cuda_event_tgt;
+        cuda_event_dft   = o.cuda_event_dft;
+        staging_slot_tgt = o.staging_slot_tgt;
+        staging_slot_dft = o.staging_slot_dft;
+        copied_tgt.store(o.copied_tgt.load());
+        copied_dft.store(o.copied_dft.load());
+        async_active_tgt = o.async_active_tgt;
+        async_active_dft = o.async_active_dft;
+
+        o.cuda_event_tgt   = nullptr;
+        o.cuda_event_dft   = nullptr;
+        o.staging_slot_tgt = -1;
+        o.staging_slot_dft = -1;
+        o.async_active_tgt = false;
+        o.async_active_dft = false;
+        o.copied_tgt.store(true);
+        o.copied_dft.store(true);
+#endif
+    }
+    return *this;
+}
+
+common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & o)
+    : n_tokens(o.n_tokens),
+      pos_min(o.pos_min),
+      pos_max(o.pos_max),
+      data_tgt(o.data_tgt),
+      data_dft(o.data_dft)
+#ifdef GGML_USE_CUDA
+      , copied_tgt(o.copied_tgt.load())
+      , copied_dft(o.copied_dft.load())
+      // cuda_event_*/staging_slot_*/async_active_* stay at defaults: copies only
+      // occur at prompt setup with an inactive capture.
+#endif
+{
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prompt_checkpoint & o) {
+    if (this != &o) {
+        this->clear();
+
+        n_tokens = o.n_tokens;
+        pos_min  = o.pos_min;
+        pos_max  = o.pos_max;
+        data_tgt = o.data_tgt;
+        data_dft = o.data_dft;
+        // keep async state at defaults
+    }
+    return *this;
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2011,10 +2220,35 @@ void common_prompt_checkpoint::update_tgt(
 
     data_tgt.resize(ckpt_size);
 
+#ifdef GGML_USE_CUDA
+    // RTX-4090 / NVIDIA-dedicated: capture asynchronously into a pinned staging
+    // buffer so the D2H transfer overlaps with subsequent prefill compute.
+    int slot = g_ckpt_staging.acquire(ckpt_size);
+    if (slot < 0) {
+        // both staging slots busy (should not happen in practice): drain and retry
+        cudaStreamSynchronize(cudaStreamPerThread);
+        slot = g_ckpt_staging.acquire(ckpt_size);
+    }
+    GGML_ASSERT(slot >= 0 && "ckpt staging pool exhausted");
+
+    cudaEvent_t ev;
+    const size_t n = llama_state_seq_get_data_ext_async(ctx, g_ckpt_staging.ptr(slot), ckpt_size, seq_id, flags, &ev);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+    cuda_event_tgt   = ev;
+    staging_slot_tgt = slot;
+    copied_tgt.store(false, std::memory_order_relaxed);
+    async_active_tgt = true;
+
+    ckpt_cb_data * d = new ckpt_cb_data{data_tgt.data(), ckpt_size, slot, &copied_tgt};
+    cudaLaunchHostFunc(cudaStreamPerThread, ckpt_host_cb, d);
+#else
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+#endif
 }
 
 void common_prompt_checkpoint::update_dft(
@@ -2029,10 +2263,32 @@ void common_prompt_checkpoint::update_dft(
 
     data_dft.resize(ckpt_size);
 
+#ifdef GGML_USE_CUDA
+    int slot = g_ckpt_staging.acquire(ckpt_size);
+    if (slot < 0) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+        slot = g_ckpt_staging.acquire(ckpt_size);
+    }
+    GGML_ASSERT(slot >= 0 && "ckpt staging pool exhausted");
+
+    cudaEvent_t ev;
+    const size_t n = llama_state_seq_get_data_ext_async(ctx, g_ckpt_staging.ptr(slot), ckpt_size, seq_id, flags, &ev);
+    if (n != ckpt_size) {
+        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+    cuda_event_dft   = ev;
+    staging_slot_dft = slot;
+    copied_dft.store(false, std::memory_order_relaxed);
+    async_active_dft = true;
+
+    ckpt_cb_data * d = new ckpt_cb_data{data_dft.data(), ckpt_size, slot, &copied_dft};
+    cudaLaunchHostFunc(cudaStreamPerThread, ckpt_host_cb, d);
+#else
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+#endif
 }
 
 void common_prompt_checkpoint::load_tgt(
@@ -2046,6 +2302,13 @@ void common_prompt_checkpoint::load_tgt(
     if (data_tgt.empty()) {
         return;
     }
+
+#ifdef GGML_USE_CUDA
+    // ensure the async capture + host callback finished before reading data_tgt
+    if (async_active_tgt && !copied_tgt.load(std::memory_order_acquire)) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+#endif
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {
@@ -2064,6 +2327,12 @@ void common_prompt_checkpoint::load_dft(
     if (data_dft.empty()) {
         return;
     }
+
+#ifdef GGML_USE_CUDA
+    if (async_active_dft && !copied_dft.load(std::memory_order_acquire)) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+#endif
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {

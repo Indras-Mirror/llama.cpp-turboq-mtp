@@ -1131,7 +1131,14 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // the pad floor controls how often the CUDA graph must be re-captured; a larger floor (e.g. 4096)
+    // yields far fewer re-capture spikes at the cost of a slightly larger captured graph. tune via
+    // LLAMA_KV_PAD_MIN (defaults to 4096).
+    uint32_t n_pad_min = 4096u;
+    if (const char * env = getenv("LLAMA_KV_PAD_MIN")) {
+        n_pad_min = (uint32_t)std::max(1, atoi(env));
+    }
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
