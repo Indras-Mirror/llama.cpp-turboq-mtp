@@ -403,8 +403,6 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 1;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             smpl = common_sampler_init(model_mtp, sparams);
         }
 
