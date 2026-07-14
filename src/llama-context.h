@@ -90,6 +90,7 @@ struct llama_context {
 
     void            set_mtp(llama_context * ctx_mtp_in);
     llama_context * get_mtp() const { return mtp.ctx_mtp; }
+    void            reset_mtp_pending();
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);

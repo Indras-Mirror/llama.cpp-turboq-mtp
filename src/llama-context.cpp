@@ -2811,6 +2811,10 @@ size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * ds
         return 0;
     }
 
+    // ── barrier: ensure all async D2H copies on backend streams complete
+    //    before the event + host callback on cudaStreamPerThread fire.
+    ggml_backend_sched_synchronize(get_sched());
+
     cudaEvent_t ev;
     CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(ev, cudaStreamPerThread));
@@ -3827,8 +3831,35 @@ bool llama_context_seq_rm(
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
         llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
+        // Full clear (p0<=0, p1<0) invalidates the cross-ubatch pending stash:
+        // ctx_mtp has no valid positions, so a stale pending_h would pair the
+        // wrong hidden state with the first token of the next prefill.
+        if (p0 <= 0 && p1 < 0) {
+            ctx_mtp->reset_mtp_pending();
+        }
     }
     return ok;
+}
+
+void llama_context::reset_mtp_pending() {
+    mtp.pending_pos = -1;
+    std::fill(mtp.pending_h.begin(), mtp.pending_h.end(), 0.0f);
+}
+
+void llama_context_seq_cp(
+    struct llama_context * ctx,
+            llama_seq_id   seq_id_src,
+            llama_seq_id   seq_id_dst,
+               llama_pos   p0,
+               llama_pos   p1) {
+    if (!ctx) {
+        return;
+    }
+    llama_memory_seq_cp(llama_get_memory(ctx), seq_id_src, seq_id_dst, p0, p1);
+
+    if (llama_context * ctx_mtp = ctx->get_mtp()) {
+        llama_memory_seq_cp(llama_get_memory(ctx_mtp), seq_id_src, seq_id_dst, p0, p1);
+    }
 }
 
 void llama_memory_seq_cp(

@@ -1111,7 +1111,7 @@ json oaicompat_chat_params_parse(
     // (new tokens) gets processed instead of a full prefill reload.
     {
         const size_t margin = std::max<int>(
-            opt.reasoning_budget + 4096,   // reasoning budget + tool calls/output
+            opt.reasoning_budget + 8192,   // reasoning budget + tool calls/output
             8192);                          // minimum safe margin
         const size_t budget = std::max<size_t>(1, opt.n_ctx) - margin;
 

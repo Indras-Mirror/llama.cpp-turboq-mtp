@@ -151,7 +151,7 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, -1, -1);
+        llama_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1);
         }
@@ -488,8 +488,8 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), other.id,     -1, -1);
-        llama_memory_seq_cp(llama_get_memory(ctx_tgt), id, other.id, -1, -1);
+        llama_context_seq_rm(ctx_tgt, other.id,     -1, -1);
+        llama_context_seq_cp(ctx_tgt, id, other.id, -1, -1);
 
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), other.id,     -1, -1);
@@ -1447,7 +1447,7 @@ private:
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped by limit, n_decoded = %d, n_predict = %d\n", slot.n_decoded, slot.task->params.n_predict);
+            SLT_INF(slot, "stopped by limit, n_decoded = %d, n_predict = %d\n", slot.n_decoded, slot.task->params.n_predict);
         }
 
         if (slot.has_new_line) {
@@ -2723,7 +2723,7 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, p0, -1)) {
+                    if (!llama_context_seq_rm(ctx_tgt, slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         slot.prompt_clear(true);
@@ -3235,11 +3235,12 @@ private:
                             {
                                 ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
-                                llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, ckpt.pos_max + 1, -1);
+                                llama_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
                             }
 
-                            // MTP (QuetzaCodetl): no analogous checkpointing — auto-mirror
-                            // wipes its tail; next prefill ubatch repopulates via streaming hook.
+                            // MTP (QuetzaCodetl): no analogous checkpointing — the auto-mirror
+                            // in llama_context_seq_rm wipes its tail; next prefill ubatch
+                            // repopulates via streaming hook.
                             if (slot.ctx_dft) {
                                 ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
@@ -3279,7 +3280,7 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
+                llama_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
                 if (slot.ctx_dft) {
                     llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, slot.prompt.tokens.pos_next(), -1);
                 }
