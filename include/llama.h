@@ -1024,6 +1024,15 @@ extern "C" {
                        llama_pos   p0,
                        llama_pos   p1);
 
+    // Like llama_memory_seq_add, but also mirrors the shift onto the attached MTP
+    // shadow context (if any), keeping its KV layout aligned with the target.
+    LLAMA_API void llama_context_seq_add(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                       llama_pos   delta);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

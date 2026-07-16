@@ -3613,6 +3613,8 @@ void llama_context::handle_mtp_for_ubatch(
 
     const bool pending_continues = mtp.pending_pos >= 0 && mtp.pending_pos + 1 == pos_start;
     if (mtp.pending_pos >= 0 && !pending_continues) {
+        LLAMA_LOG_DEBUG("%s: pending_pos mismatch (pending=%d, pos_start=%d) — discarding stale pending state\n",
+                        __func__, (int) mtp.pending_pos, (int) pos_start);
         mtp.pending_pos = -1;
     }
 
@@ -3660,6 +3662,9 @@ void llama_context::handle_mtp_for_ubatch(
     ggml_backend_tensor_get(t, mtp.pending_h.data(),
         (size_t) (n_rows - 1) * row_bytes, row_bytes);
     mtp.pending_pos = pos_start + n_rows - 1;
+
+    LLAMA_LOG_DEBUG("%s: processed %d rows, hook_batch n=%d, pending_pos=%d\n",
+                    __func__, n_rows, n_out, (int) mtp.pending_pos);
 }
 
 void llama_synchronize(llama_context * ctx) {
@@ -3842,6 +3847,7 @@ bool llama_context_seq_rm(
 }
 
 void llama_context::reset_mtp_pending() {
+    LLAMA_LOG_DEBUG("%s: resetting MTP pending state\n", __func__);
     mtp.pending_pos = -1;
     std::fill(mtp.pending_h.begin(), mtp.pending_h.end(), 0.0f);
 }
@@ -3896,6 +3902,22 @@ void llama_memory_seq_add(
     }
 
     mem->seq_add(seq_id, p0, p1, delta);
+}
+
+void llama_context_seq_add(
+    struct llama_context * ctx,
+            llama_seq_id   seq_id,
+               llama_pos   p0,
+               llama_pos   p1,
+               llama_pos   delta) {
+    if (!ctx) {
+        return;
+    }
+    llama_memory_seq_add(llama_get_memory(ctx), seq_id, p0, p1, delta);
+
+    if (llama_context * ctx_mtp = ctx->get_mtp()) {
+        llama_memory_seq_add(llama_get_memory(ctx_mtp), 0, p0, p1, delta);
+    }
 }
 
 void llama_memory_seq_div(

@@ -149,7 +149,8 @@ struct server_slot {
             GGML_ASSERT(!is_processing());
         }
 
-        SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+        SLT_INF(*this, "clearing prompt with %zu tokens (pos_next=%d, n_draft_accepted=%d/%d)\n",
+                prompt.tokens.size(), prompt.tokens.pos_next(), n_draft_accepted, n_draft_total);
 
         llama_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
@@ -801,7 +802,17 @@ private:
                 auto cparams_mtp = common_context_params_to_llama(params_base);
                 cparams_mtp.n_ctx     = params_base.n_ctx;
                 cparams_mtp.n_seq_max = 1;
-                cparams_mtp.n_rs_seq  = 0;
+                // The MTP shadow context MUST keep the same recurrent-state rollback
+                // depth as the target. ctx_mtp runs an auto-regressive draft chain on
+                // the same hybrid (GDN/SWA) model; when a draft step is rejected,
+                // common_speculative_state_mtp::accept() calls seq_rm on ctx_mtp to drop
+                // the unwanted KV rows. With n_rs_seq == 0 the GDN recurrent 'S' state is
+                // NOT rolled back, so ctx_mtp's hidden state permanently drifts ahead of
+                // the target. Over tens of thousands of tokens that drift makes the draft
+                // head emit a fixed token repeatedly -> the high-context acceptance loop
+                // signature. Giving ctx_mtp the target's n_rs_seq (= n_max) lets seq_rm
+                // restore the correct 'S' on every reject, keeping the draft aligned.
+                cparams_mtp.n_rs_seq  = (uint32_t) std::max(1, params_base.speculative.draft.n_max);
 
                 params_base.speculative.mtp.model   = model_mtp.get();
                 params_base.speculative.mtp.cparams = cparams_mtp;
@@ -1233,7 +1244,8 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                SRV_WRN("purging idle slot %d with %zu tokens (pos_next=%d, is_mtp=%d)\n",
+                        slot.id, slot.prompt.tokens.size(), slot.prompt.tokens.pos_next(), slot.is_mtp());
 
                 slot.prompt_clear(false);
 
@@ -1881,6 +1893,24 @@ private:
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
+        // Re-sync the MTP shadow context to the target's real frontier.
+        // After a context reload (e.g. a new request reusing the slot), the target
+        // is re-prefilled from position 0 while ctx_mtp may still hold stale KV
+        // ahead of the new frontier. The streaming hook skips mirroring whenever
+        // pos_start <= pos_max_mtp, so a stale ctx_mtp tail is never corrected and
+        // the draft head desyncs from the target (acceptance collapses / loops).
+        // Trimming ctx_mtp back to the target frontier here guarantees the hook
+        // rebuilds it from the correct hidden states on the next decode.
+        // llama_context_seq_rm mirrors the trim onto ctx_mtp automatically.
+        {
+            const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+            if (pos_max_mtp > pos_max) {
+                llama_context_seq_rm(ctx_tgt, slot.id, pos_max + 1, -1);
+                SLT_DBG(slot, "mtp resync: trimmed stale ctx_mtp tail from %d to frontier %d\n",
+                        (int) pos_max_mtp, (int) pos_max);
+            }
+        }
+
         SLT_WRN(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -2204,9 +2234,7 @@ private:
         for (server_slot & slot : slots) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
-                    // this check is redundant (for good)
-                    // we should never get here, because generation should already stopped in process_token()
-                    send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                    send_error(slot, string_format("request exceeds the available context size (%d tokens), try increasing it", slot.n_ctx), ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                     slot.release();
                     continue;
                 }
@@ -2235,13 +2263,20 @@ private:
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
-                SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                const llama_pos pos_next_before = slot.prompt.tokens.pos_next();
+                const int32_t  n_tokens_before  = slot.prompt.n_tokens();
+                SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d, pos_next = %d\n",
+                        n_keep, n_left, n_discard, pos_next_before);
 
                 // ctx_shift is disabled for MTP slots at server startup
                 GGML_ASSERT(!slot.is_mtp()
                             && "ctx_shift path entered for MTP slot — disable check missing");
-                llama_memory_seq_rm (llama_get_memory(ctx_tgt), slot.id, n_keep            , n_keep + n_discard);
-                llama_memory_seq_add(llama_get_memory(ctx_tgt), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                // Use the MTP-aware variants so the shadow context (ctx_mtp) stays mirrored.
+                // Without this, repeated shifts desynchronise the MTP head's KV cache,
+                // causing stale drafts → content loops.
+                llama_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
+                llama_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 if (ctx_dft) {
                     llama_memory_seq_rm (llama_get_memory(ctx_dft.get()), slot.id, n_keep            , n_keep + n_discard);
@@ -2263,6 +2298,9 @@ private:
                     slot.prompt.tokens.clear();
                     slot.prompt.tokens.insert(new_tokens);
                 }
+
+                SLT_WRN(slot, "slot context shift done, n_tokens: %d → %d, pos_next: %d → %d\n",
+                        n_tokens_before, (int) slot.prompt.n_tokens(), pos_next_before, slot.prompt.tokens.pos_next());
 
                 slot.truncated = true;
             }
@@ -3020,7 +3058,18 @@ private:
                     n_batch /= 2;
                 }
 
-                SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, i = %d, n_batch = %d, ret = %d\n", i, n_batch, ret);
+                {
+                    std::string slots_info;
+                    for (const auto & s : slots) {
+                        if (!slots_info.empty()) slots_info += ", ";
+                        slots_info += std::to_string(s.id) + ":" + std::to_string(s.prompt.n_tokens()) +
+                                      (s.is_mtp() ? "(mtp)" : "") +
+                                      (s.state == SLOT_STATE_GENERATING ? "(gen)" :
+                                       s.state == SLOT_STATE_DONE_PROMPT ? "(prompt)" : "(idle)");
+                    }
+                    SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, i = %d, n_batch = %d, ret = %d, slots: [%s]\n",
+                            i, n_batch, ret, slots_info.c_str());
+                }
 
                 continue; // continue loop of n_batch
             }
@@ -3254,28 +3303,40 @@ private:
                         }
                     }
 
-                    if (trace > 0) {
-                        SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                {
+                    std::string draft_str;
+                    for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                        if (i > 0) draft_str += " ";
+                        draft_str += std::to_string(slot.spec_draft[i]);
                     }
-
-                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
-
-                    slot.spec_draft = std::move(accepted);
+                    std::string accepted_str;
+                    for (size_t i = 0; i < accepted.size(); ++i) {
+                        if (i > 0) accepted_str += " ";
+                        accepted_str += std::to_string(accepted[i]);
+                    }
+                    SLT_DBG(slot, "draft tokens: [%s], accepted: [%s] (%zu/%zu)\n",
+                            draft_str.c_str(), accepted_str.c_str(),
+                            accepted.size() - 1, n_draft);
                 }
 
-                const int64_t t_current = ggml_time_us();
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
-                const auto ids = std::move(slot.spec_draft);
+                slot.spec_draft = std::move(accepted);
+            }
 
-                slot.n_decoded += ids.size();
-                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+            const int64_t t_current = ggml_time_us();
 
-                // update how many tokens out of those tested were accepted
-                slot.n_draft_accepted += ids.size() - 1;
+            const auto ids = std::move(slot.spec_draft);
 
-                // add accepted tokens to the prompt
-                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+            slot.n_decoded += ids.size();
+            slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+            // update how many tokens out of those tested were accepted
+            slot.n_draft_accepted += ids.size() - 1;
+
+            // add accepted tokens to the prompt
+            slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+            slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);

@@ -475,6 +475,9 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         llama_token cond_tok = dp.id_last;
         llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
 
+        LOG_DBG("%s: generating up to %d drafts from ctx_mtp pos=%d, cond_tok=%d\n",
+                __func__, n_max, (int) pos, (int) cond_tok);
+
         // auto-regressive MTP drafting loop
         for (int32_t k = 0; k < n_max; ++k) {
             ggml_tensor * src;
@@ -522,6 +525,15 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         }
 
         last_n_drafted = (uint16_t) dp.result->size();
+
+        {
+            std::string draft_ids;
+            for (size_t i = 0; i < dp.result->size(); ++i) {
+                if (i > 0) draft_ids += ", ";
+                draft_ids += std::to_string((*dp.result)[i]);
+            }
+            LOG_DBG("%s: drafted %d tokens: [%s]\n", __func__, (int) dp.result->size(), draft_ids.c_str());
+        }
         // NOTE: do NOT set dp.drafting = false — the upstream
         // common_speculative_draft() clears it AFTER recording impl_last.
     }

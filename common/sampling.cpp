@@ -633,6 +633,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
 
         if (draft[i] != id) {
+            LOG_DBG("%s: draft rejected at i=%zu: draft=%d != sampled=%d\n", __func__, i, draft[i], id);
             break;
         }
     }
