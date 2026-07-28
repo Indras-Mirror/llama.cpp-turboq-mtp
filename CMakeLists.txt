@@ -288,3 +288,14 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# CPack packaging
+set(CPACK_PACKAGE_NAME "llama-turboq")
+set(CPACK_PACKAGE_VERSION "${LLAMA_INSTALL_VERSION}")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "llama.cpp fork with TurboQuant and MTP speculative decoding")
+set(CPACK_PACKAGE_VENDOR "jtrefon")
+set(CPACK_PACKAGE_CONTACT "jtrefon")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "jtrefon")
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_STRIP_FILES TRUE)
+include(CPack)

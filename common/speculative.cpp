@@ -386,6 +386,12 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     static constexpr float ADAPT_LO    = 0.35f;  // sustained acceptance below -> drop to n_min
     static constexpr float ADAPT_HI    = 0.50f;  // sustained acceptance above -> full n_max
 
+    // Loop breaker: when every MTP draft is accepted for N consecutive rounds,
+    // the model is likely stuck in a repetitive pattern (e.g. tool-call loop).
+    // Force a single-sample round (n_eff=0) to let EOS surface.
+    int32_t  full_accept_streak = 0;
+    static constexpr int32_t FULL_ACCEPT_LIMIT = 60;
+
     common_speculative_state_mtp(enum common_speculative_type type,
                                  llama_context * ctx_tgt,
                                  llama_context * ctx_mtp,
@@ -429,6 +435,15 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & prompt) override {
         last_n_accepted = -1;
         last_n_drafted  = 0;
+        full_accept_streak = 0;
+
+        // re-init sampler each request to keep MTP stochastic and avoid drift toward greediness
+        common_sampler_free(smpl);
+        {
+            common_params_sampling sparams;
+            sparams.no_perf = false;
+            smpl = common_sampler_init(llama_get_model(ctx_mtp), sparams);
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -454,7 +469,9 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         if (!dp.drafting) return;
 
         const int32_t n_max_req = std::max(1, dp.n_max > 0 ? dp.n_max : 3);
-        const int32_t n_max     = adapt_enabled ? std::max(1, std::min(n_max_req, n_eff)) : n_max_req;
+        const int32_t n_max     = adapt_enabled
+            ? (n_eff > 0 ? std::max(1, std::min(n_max_req, n_eff)) : 0)
+            : n_max_req;
         dp.n_max = n_max;   // keep upstream truncation in sync with adapted depth
         const size_t  row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -541,6 +558,22 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
         const int32_t n_drafted_last = (int32_t) last_n_drafted;
+        if (n_drafted_last > 0) {
+            // Loop breaker: detect repetitive full-accept (all drafts accepted)
+            if (n_accepted > 0 && n_accepted >= (uint16_t) n_drafted_last) {
+                if (++full_accept_streak >= FULL_ACCEPT_LIMIT) {
+                    LOG_INF("%s: full-accept streak=%d — forcing single-sample round\n",
+                            __func__, full_accept_streak);
+                    n_eff = 0;
+                    full_accept_streak = 0;
+                }
+            } else {
+                full_accept_streak = 0;
+                if (n_eff == 0) {
+                    n_eff = n_max_cfg;  // recover after forced single-sample
+                }
+            }
+        }
         if (adapt_enabled && n_drafted_last > 0) {
             const float inst = (float) n_accepted / (float) n_drafted_last;
             ema_acc = (ema_acc < 0.0f) ? inst : (ADAPT_ALPHA * inst + (1.0f - ADAPT_ALPHA) * ema_acc);

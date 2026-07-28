@@ -1122,9 +1122,12 @@ json oaicompat_chat_params_parse(
             for (const auto & part : msg.content_parts) {
                 chars += part.text.size();
             }
+            for (const auto & tc : msg.tool_calls) {
+                chars += tc.name.size() + tc.arguments.size() + tc.id.size() + 20;
+            }
             // Template overhead: ~5 tokens per message for markers + role text
-            // Content: ~3 chars per token (conservative estimate)
-            return chars / 3 + 5;
+            // Content: ~2 chars per token (conservative; JSON/tool syntax is 1-2 chars/token)
+            return chars / 2 + 5;
         };
 
         size_t total = 0;
