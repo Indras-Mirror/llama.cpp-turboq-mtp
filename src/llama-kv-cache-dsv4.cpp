@@ -1043,12 +1043,20 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
     const bool unified_raw = false;
 
+    // DSV4 concatenates raw and compressed K tensors with 4D head-based views
+    // (deepseek4.cpp build_csa_attention / build_hca_attention / build_lid_top_k).
+    // get_k returns a packed 3D view (ne[2] == n_stream) for TBQ types, which breaks
+    // both the ne[2] == n_kv view contract and the concat (type/shape mismatch).
+    // TBQ is unsupported for the whole DSV4 cache; fall back to Q8_0.
+    const ggml_type type_k_use = (type_k == GGML_TYPE_TBQ3_0 || type_k == GGML_TYPE_TBQ4_0)
+            ? GGML_TYPE_Q8_0 : type_k;
+
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
     dsv4_make_k_only(hparams_raw);
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
-            model, hparams_raw, type_k, type_v,
+            model, hparams_raw, type_k_use, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
             nullptr, filter_raw, reuse, nullptr);
 
@@ -1085,7 +1093,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_csa = std::make_unique<llama_kv_cache>(
-            model, hparams_csa, type_k, type_v,
+            model, hparams_csa, type_k_use, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1093,7 +1101,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
 
     kv_hca = std::make_unique<llama_kv_cache>(
-            model, hparams_hca, type_k, type_v,
+            model, hparams_hca, type_k_use, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
@@ -1101,7 +1109,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            model, hparams_lid, type_k_use, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
