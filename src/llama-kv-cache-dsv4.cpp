@@ -1045,7 +1045,29 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     // DSV4 stores TBQ3_0/TBQ4_0 K in all four caches; the packed 3D get_k view is
     // dequantized to F32 4D at the read sites via dequant_k_read (deepseek4.cpp).
+    // Per-cache K quant types: the raw (SWA) cache uses type_k; the compressed caches
+    // (csa/hca/lid) use DSV4_CTK_COMP when set (e.g. tbq3_0 for memory headroom),
+    // defaulting to type_k. TBQ3 on the compressed caches flows through the F32 dequant
+    // path at the read sites (no fused TBQ3 flash-attn kernel exists).
     const ggml_type type_k_use = type_k;
+
+    ggml_type type_k_comp_use = GGML_TYPE_COUNT;
+    if (const char * env_comp = getenv("DSV4_CTK_COMP"); env_comp != nullptr && env_comp[0] != '\0') {
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            if (strcmp(ggml_type_name((ggml_type) t), env_comp) == 0) {
+                type_k_comp_use = (ggml_type) t;
+                break;
+            }
+        }
+        if (type_k_comp_use == GGML_TYPE_COUNT) {
+            LLAMA_LOG_WARN("%s: ignoring invalid DSV4_CTK_COMP=\"%s\" (falling back to type_k)\n", __func__, env_comp);
+            type_k_comp_use = type_k;
+        } else {
+            LLAMA_LOG_INFO("%s: DSV4 compressed-cache K type (DSV4_CTK_COMP) = %s\n", __func__, env_comp);
+        }
+    } else {
+        type_k_comp_use = type_k;
+    }
 
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
@@ -1089,7 +1111,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_csa = std::make_unique<llama_kv_cache>(
-            model, hparams_csa, type_k_use, type_v,
+            model, hparams_csa, type_k_comp_use, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1097,7 +1119,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
 
     kv_hca = std::make_unique<llama_kv_cache>(
-            model, hparams_hca, type_k_use, type_v,
+            model, hparams_hca, type_k_comp_use, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
@@ -1105,7 +1127,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k_use, type_v,
+            model, hparams_lid, type_k_comp_use, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
