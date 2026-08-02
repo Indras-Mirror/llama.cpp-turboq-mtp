@@ -79,6 +79,116 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+// strided concat for quantized types: block-granular byte copy honoring nb strides.
+// concat_non_cont cannot be reused because for quantized tensors nb[0] is the byte size
+// of one quantized block (not one element) — blocks, not elements, are the copy unit.
+// The grid is flattened over (i1, i2, i3) so large row counts (e.g. the DSV4 raw+csa
+// concat at 512K) do not hit the 65535 limit on gridDim.y/z.
+template <int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_quant(
+        const char * src0,
+        const char * src1,
+              char * dst,
+        int64_t   ne00,
+        int64_t   ne01,
+        int64_t   ne02,
+        int64_t   ne03,
+        uint64_t  nb00,
+        uint64_t  nb01,
+        uint64_t  nb02,
+        uint64_t  nb03,
+        int64_t   ne10,
+        int64_t   ne11,
+        int64_t   ne12,
+        int64_t   ne13,
+        uint64_t  nb10,
+        uint64_t  nb11,
+        uint64_t  nb12,
+        uint64_t  nb13,
+        int64_t   ne0,
+        int64_t   ne1,
+        int64_t   ne2,
+        int64_t   ne3,
+        uint64_t  nb0,
+        uint64_t  nb1,
+        uint64_t  nb2,
+        uint64_t  nb3,
+        int       blck_size,
+        int       blck_bytes) {
+    static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
+
+    const int64_t n_blk  = ne0  / blck_size; // dst  blocks along dim 0
+    const int64_t n_blk0 = ne00 / blck_size; // src0 blocks along dim 0
+    const int64_t n_cells = ne1 * ne2 * ne3;
+
+    for (int64_t cell = blockIdx.x; cell < n_cells; cell += gridDim.x) {
+        const int64_t i3 = cell / (ne1 * ne2);
+        const int64_t i2 = (cell / ne1) % ne2;
+        const int64_t i1 = cell % ne1;
+
+        for (int64_t i0 = threadIdx.x; i0 < n_blk; i0 += blockDim.x) {
+            const char * x;
+
+            if (i0 < n_blk0 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                x = src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00;
+            } else {
+                if constexpr (dim == 0) {
+                    x = src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - n_blk0)*nb10;
+                } else if constexpr (dim == 1) {
+                    x = src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10;
+                } else if constexpr (dim == 2) {
+                    x = src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10;
+                } else if constexpr (dim == 3) {
+                    x = src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10;
+                }
+            }
+
+            char * y = dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0;
+
+            for (int j = 0; j < blck_bytes; j++) {
+                y[j] = x[j];
+            }
+        }
+    }
+}
+
+static void concat_quant_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    const int64_t n_cells = dst->ne[1] * dst->ne[2] * dst->ne[3];
+    const int num_blocks  = (int) std::min<int64_t>(n_cells, 1 << 30);
+    const int blck_size   = ggml_blck_size(src0->type);
+    const int blck_bytes  = (int) ggml_type_size(src0->type);
+
+    auto launch_kernel = [&](auto dim) {
+        concat_quant<dim><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+            blck_size, blck_bytes);
+    };
+    switch (dim) {
+        case 0:
+            launch_kernel(std::integral_constant<int, 0>{});
+            break;
+        case 1:
+            launch_kernel(std::integral_constant<int, 1>{});
+            break;
+        case 2:
+            launch_kernel(std::integral_constant<int, 2>{});
+            break;
+        case 3:
+            launch_kernel(std::integral_constant<int, 3>{});
+            break;
+        default:
+            GGML_ABORT("Invalid dim: %d", dim);
+            break;
+    }
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -160,8 +270,10 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (ggml_is_quantized(src0->type)) {
+        // strided quantized concat: block-granular copy honoring nb (see concat_quant).
+        concat_quant_cuda(src0, src1, dst, dim, stream);
     } else {
-        GGML_ASSERT(!ggml_is_quantized(src0->type));
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
@@ -206,18 +318,18 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->type  == src0->type);
 
     if (ggml_is_quantized(src0->type)) {
-        if (dim == 3) {
-            GGML_ASSERT(ggml_is_contiguous(src0));
-            GGML_ASSERT(ggml_is_contiguous(src1));
-        } else {
-            GGML_ASSERT(ggml_is_contiguous_to_3(src0));
-            GGML_ASSERT(ggml_is_contiguous_to_3(src1));
-        }
         GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
         GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
 
-        // if first 3 dimensions are contiguous and ne[0] is multiple of the block size we can concat both tensors as byte tensors
-        concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
+        if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+            // if first 3 dimensions are contiguous and ne[0] is multiple of the block size we can concat both tensors as byte tensors
+            concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
+        } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+            concat_cuda<uint8_t>(src0, src1, dst, dim, stream);
+        } else {
+            // strided quantized concat: block-granular copy honoring nb (see concat_quant).
+            concat_quant_cuda(src0, src1, dst, dim, stream);
+        }
     } else {
         GGML_ASSERT(ggml_blck_size(src0->type) == 1);
 
