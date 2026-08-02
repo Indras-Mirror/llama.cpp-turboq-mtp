@@ -1248,13 +1248,9 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
 
-    // DSV4 concatenates raw and compressed K tensors with 4D head-based views
-    // (deepseek4.cpp build_csa_attention / build_hca_attention / build_lid_top_k).
-    // get_k returns a packed 3D view (ne[2] == n_stream) for TBQ types, which breaks
-    // both the ne[2] == n_kv view contract and the concat (type/shape mismatch).
-    // TBQ is unsupported for the whole DSV4 cache; fall back to Q8_0.
-    const ggml_type type_k_use = (type_k == GGML_TYPE_TBQ3_0 || type_k == GGML_TYPE_TBQ4_0)
-            ? GGML_TYPE_Q8_0 : type_k;
+    // DSV4 stores TBQ3_0/TBQ4_0 K in all four caches; the packed 3D get_k view is
+    // dequantized to F32 4D at the read sites via dequant_k_read (deepseek4.cpp).
+    const ggml_type type_k_use = type_k;
 
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
