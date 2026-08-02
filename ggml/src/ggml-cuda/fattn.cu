@@ -614,69 +614,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// TBQ4 ncols switch — generic on DKQ/DV, supports D=128 and D=256.
-template <int DKQ, int DV, int ncols2>
-static void ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const ggml_tensor * Q = dst->src[0];
-
-    if constexpr (ncols2 <= 8) {
-        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
-            return;
-        }
-    }
-
-    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || Q->ne[1] <= 32/ncols2) {
-        ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
-        return;
-    }
-
-    ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
-}
-
-static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * KQV  = dst;
-
-    const int DKQ = (int)Q->ne[0];
-    const int DV  = (int)V->ne[0];
-    GGML_ASSERT(DKQ == 128 || DKQ == 256);
-    GGML_ASSERT(DV == DKQ);
-
-    float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-
-    const ggml_tensor * mask = dst->src[3];
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-
-    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-
-#define TBQ4_DISPATCH_NCOLS1(DKQ_VAL, DV_VAL)                                        \
-    if (use_gqa_opt && gqa_ratio > 4) {                                              \
-        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 8>(ctx, dst); \
-    } else if (use_gqa_opt && gqa_ratio > 2) {                                       \
-        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 4>(ctx, dst); \
-    } else if (use_gqa_opt && gqa_ratio > 1) {                                       \
-        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 2>(ctx, dst); \
-    } else {                                                                         \
-        ggml_cuda_flash_attn_ext_mma_tbq4_switch_ncols1<DKQ_VAL, DV_VAL, 1>(ctx, dst); \
-    }
-
-    if (DKQ == 128) {
-        TBQ4_DISPATCH_NCOLS1(128, 128)
-    } else {
-        TBQ4_DISPATCH_NCOLS1(256, 256)
-    }
-
-#undef TBQ4_DISPATCH_NCOLS1
-
-    // Apply rotate_inverse to the output (rotated-domain → original domain).
-    const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
-    tbq4_rotate_output_cuda((float *) KQV->data, nrows, DV, ctx.stream());
 
 // TBQ4 ncols switch — generic on DKQ/DV, supports D=128 and D=256.
 template <int DKQ, int DV, int ncols2>
@@ -785,4 +722,5 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
 
