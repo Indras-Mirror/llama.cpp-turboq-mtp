@@ -1180,6 +1180,20 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * k,
                 int64_t n_head_kv) const;
 
+        // Native TBQ read: fold the packed 3D get_k view to the 4D head-based view with
+        // explicit strides, NO cast — the concat and fused MMA_TBQ4 flash-attn paths
+        // consume TBQ directly. Passthrough for all other types.
+        ggml_tensor * tbq_k_view(
+                ggml_tensor * k,
+                int64_t n_head_kv) const;
+
+        // Restore the packed 3D layout after a native concat of two 4D head views (the
+        // TBQ branch of build_attn_mha reads the stream count from ne[2]). The concat
+        // result is contiguous, so this is a metadata-only reshape. Passthrough for
+        // non-TBQ results.
+        ggml_tensor * tbq_concat_3d(
+                ggml_tensor * k) const;
+
         ggml_tensor * build_csa_lid_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,

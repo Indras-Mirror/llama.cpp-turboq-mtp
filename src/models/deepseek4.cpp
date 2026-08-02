@@ -536,6 +536,36 @@ ggml_tensor * llama_model_deepseek4::graph::dequant_k_read(ggml_tensor * k, int6
     return k;
 }
 
+ggml_tensor * llama_model_deepseek4::graph::tbq_k_view(ggml_tensor * k, int64_t n_head_kv) const {
+    // Native TBQ read: fold the packed 3D view ([n_embd_k_gqa, n_kv, ns]) into the 4D
+    // head-based view ([n_embd_head_k, n_head_kv, n_kv, ns]) with explicit strides — NO
+    // cast — so concat can concatenate TBQ+TBQ natively and the fused MMA_TBQ4 flash-attn
+    // kernel consumes the result directly. DSV4 is single-KV-head (n_head_kv == 1), so
+    // this is a metadata-only relabeling (row stride = nb[1], stream stride = nb[2]).
+    // Passthrough for all other types.
+    if (k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0) {
+        GGML_ASSERT(n_head_kv > 0);
+        GGML_ASSERT(k->ne[0] % n_head_kv == 0);
+        k = ggml_view_4d(ctx0, k,
+                k->ne[0] / n_head_kv, n_head_kv, k->ne[1], k->ne[2],
+                k->nb[1], k->nb[1], k->nb[2], 0);
+    }
+
+    return k;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::tbq_concat_3d(ggml_tensor * k) const {
+    // build_attn_mha's TBQ branch reads the stream count from ne[2] (packed 3D layout),
+    // while concat produces the 4D head view [n_embd_head, n_head_kv, n_rows, ns]. The
+    // concat result is contiguous, so folding the head dim (n_head_kv == 1) back into the
+    // rows is a metadata-only reshape. Passthrough for non-TBQ results (4D layout).
+    if (k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0) {
+        k = ggml_reshape_3d(ctx0, k, k->ne[0], k->ne[1]*k->ne[2], k->ne[3]);
+    }
+
+    return k;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -695,12 +725,34 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
-    raw_k = dequant_k_read(raw_k, 1);
+    ggml_tensor * csa_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+    const int64_t n_csa = inp_csa.kq_mask->ne[0];
+
+    // Native TBQ4 concat only when both sides are TBQ4 (the only type with a fused FA
+    // kernel). Mixed types (e.g. raw=TBQ4 + comp=TBQ3 via the DSV4_CTK_COMP per-cache
+    // override) fall back to the F32 dequant path so the concat stays type-homogeneous
+    // and TBQ3 never reaches the fused flash-attn dispatch (no fused TBQ3 kernel).
+    const bool native_concat = raw_k->type == GGML_TYPE_TBQ4_0 && csa_k->type == GGML_TYPE_TBQ4_0;
+    if (native_concat) {
+        raw_k = tbq_k_view(raw_k, 1);
+        csa_k = tbq_k_view(csa_k, 1);
+    } else {
+        raw_k = dequant_k_read(raw_k, 1);
+        csa_k = dequant_k_read(csa_k, 1);
+        // mixed per-cache types (e.g. raw=Q8_0 + comp=TBQ3): dequant_k_read casts TBQ
+        // to F32 but passthroughs non-TBQ, so force the non-F32 side to F32 to keep the
+        // concat type-homogeneous
+        if (raw_k->type != csa_k->type) {
+            if (raw_k->type != GGML_TYPE_F32) {
+                raw_k = ggml_cast(ctx0, raw_k, GGML_TYPE_F32);
+            }
+            if (csa_k->type != GGML_TYPE_F32) {
+                csa_k = ggml_cast(ctx0, csa_k, GGML_TYPE_F32);
+            }
+        }
+    }
     cb(raw_k, "csa_raw_k", il);
 
-    ggml_tensor * csa_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
-    csa_k = dequant_k_read(csa_k, 1);
-    const int64_t n_csa = inp_csa.kq_mask->ne[0];
     GGML_ASSERT(n_csa > 0);
     GGML_ASSERT(n_csa <= csa_k->ne[2]);
 
@@ -710,6 +762,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(csa_k, "csa_comp_k", il);
 
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+    if (native_concat) {
+        k_all = tbq_concat_3d(k_all);
+    }
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
@@ -752,12 +807,30 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
-    raw_k = dequant_k_read(raw_k, 1);
+    ggml_tensor * hca_k = inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
+    const int64_t n_hca = inp_hca.kq_mask->ne[0];
+
+    // Same native-vs-dequant split as the csa site: native TBQ4 concat only when both
+    // sides are TBQ4; mixed/other types take the F32 dequant path (type-homogeneous).
+    const bool native_concat = raw_k->type == GGML_TYPE_TBQ4_0 && hca_k->type == GGML_TYPE_TBQ4_0;
+    if (native_concat) {
+        raw_k = tbq_k_view(raw_k, 1);
+        hca_k = tbq_k_view(hca_k, 1);
+    } else {
+        raw_k = dequant_k_read(raw_k, 1);
+        hca_k = dequant_k_read(hca_k, 1);
+        // mixed per-cache types: keep the concat type-homogeneous (see csa site)
+        if (raw_k->type != hca_k->type) {
+            if (raw_k->type != GGML_TYPE_F32) {
+                raw_k = ggml_cast(ctx0, raw_k, GGML_TYPE_F32);
+            }
+            if (hca_k->type != GGML_TYPE_F32) {
+                hca_k = ggml_cast(ctx0, hca_k, GGML_TYPE_F32);
+            }
+        }
+    }
     cb(raw_k, "hca_raw_k", il);
 
-    ggml_tensor * hca_k = inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
-    hca_k = dequant_k_read(hca_k, 1);
-    const int64_t n_hca = inp_hca.kq_mask->ne[0];
     GGML_ASSERT(n_hca > 0);
     GGML_ASSERT(n_hca <= hca_k->ne[2]);
 
@@ -767,6 +840,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     cb(hca_k, "hca_comp_k", il);
 
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+    if (native_concat) {
+        k_all = tbq_concat_3d(k_all);
+    }
     cb(k_all, "hca_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
