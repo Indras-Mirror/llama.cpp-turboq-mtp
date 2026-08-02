@@ -1173,6 +1173,13 @@ struct llama_model_deepseek4 : public llama_model_base {
                 const char * name,
                 int il) const;
 
+        // Dequant TBQ3_0/TBQ4_0 packed K (3D view [n_embd_k_gqa, n_kv, ns]) to F32 and
+        // widen to the 4D head-based contract [n_embd_head, n_head_kv, n_kv, ns] that
+        // the DSV4 view/concat consumers expect. Passthrough for all other types.
+        ggml_tensor * dequant_k_read(
+                ggml_tensor * k,
+                int64_t n_head_kv) const;
+
         ggml_tensor * build_csa_lid_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,

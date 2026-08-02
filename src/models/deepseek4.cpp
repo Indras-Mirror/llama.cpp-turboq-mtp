@@ -520,6 +520,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
     return comp;
 }
 
+ggml_tensor * llama_model_deepseek4::graph::dequant_k_read(ggml_tensor * k, int64_t n_head_kv) const {
+    // get_k returns a packed 3D view ([n_embd_k_gqa, n_kv, ns]) for TBQ types instead
+    // of the 4D head-based view ([n_embd_head_k, n_head_kv, n_kv, ns]) that the DSV4
+    // attention sites consume. Dequant-at-read: cast the packed TBQ rows to F32, then
+    // reshape to 4D (no copy). DSV4 is single-KV-head, so n_head_kv == 1 and the packed
+    // view is the 4D view with the head dim collapsed. Passthrough for all other types.
+    if (k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0) {
+        GGML_ASSERT(n_head_kv > 0);
+        GGML_ASSERT(k->ne[0] % n_head_kv == 0);
+        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+        k = ggml_reshape_4d(ctx0, k, k->ne[0] / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
+    }
+
+    return k;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -566,6 +582,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     cb(indexer_weights, "lid_weights", il);
 
     ggml_tensor * indexer_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
+    // lid cache is single-head (n_head_kv_arr forced to 1 in llama-kv-cache-dsv4.cpp)
+    indexer_k = dequant_k_read(indexer_k, 1);
     const int64_t n_lid = inp_lid.kq_mask->ne[0];
     GGML_ASSERT(n_lid > 0);
     GGML_ASSERT(n_lid <= indexer_k->ne[2]);
@@ -677,9 +695,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
+    raw_k = dequant_k_read(raw_k, 1);
     cb(raw_k, "csa_raw_k", il);
 
     ggml_tensor * csa_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+    csa_k = dequant_k_read(csa_k, 1);
     const int64_t n_csa = inp_csa.kq_mask->ne[0];
     GGML_ASSERT(n_csa > 0);
     GGML_ASSERT(n_csa <= csa_k->ne[2]);
@@ -732,9 +752,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
+    raw_k = dequant_k_read(raw_k, 1);
     cb(raw_k, "hca_raw_k", il);
 
     ggml_tensor * hca_k = inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
+    hca_k = dequant_k_read(hca_k, 1);
     const int64_t n_hca = inp_hca.kq_mask->ne[0];
     GGML_ASSERT(n_hca > 0);
     GGML_ASSERT(n_hca <= hca_k->ne[2]);
