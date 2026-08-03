@@ -3,6 +3,7 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-tbq4.cuh"
+#include "fattn-mma-tbq3.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -583,8 +584,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
+    constexpr bool is_tbq3_kv      = (type_K == GGML_TYPE_TBQ3_0 || type_V == GGML_TYPE_TBQ3_0);
     constexpr bool is_tbq4_kv      = (type_K == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ4_0);
-    constexpr int  nstages         = is_tbq4_kv ? ggml_cuda_fattn_mma_get_nstages_tbq4(DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr bool is_tbq_kv       = is_tbq3_kv || is_tbq4_kv;
+    // TBQ3 always uses the synchronous path (nstages=0): the nstages=2 raw-byte
+    // staging pipeline is TBQ4-specific (66 B rows, int-granular copy) and TBQ3's
+    // 50 B rows have no aligned staging port. The shipped TBQ4_KV_FUSED config
+    // forces nstages=0 for the TBQ path anyway.
+    constexpr int  nstages         = is_tbq_kv
+        ? (is_tbq3_kv ? 0 : ggml_cuda_fattn_mma_get_nstages_tbq4(DKQ, DV, ncols))
+        : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
 
@@ -655,7 +664,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
         if constexpr (nstages <= 1) {
-            if constexpr (!is_tbq4_kv) {
+            if constexpr (!is_tbq_kv) {
                 const int k0_diff = k0_stop - k0_start;
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -669,6 +678,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 constexpr int nthreads_tbq4 = nwarps * ggml_cuda_get_physical_warp_size();
                 const int stride_K_bytes = stride_K * int(sizeof(half2));
                 flash_attn_ext_tbq4_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_tbq4, oob_check>(
+                    K_raw + int64_t(k_VKQ_0) * stride_K_bytes, tile_K, stride_K_bytes, k_VKQ_sup);
+                asm volatile("" ::: "memory");
+            } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
+                asm volatile("" ::: "memory");
+                const char * K_raw = (const char *)K_h2;
+                constexpr int nthreads_tbq3 = nwarps * ggml_cuda_get_physical_warp_size();
+                const int stride_K_bytes = stride_K * int(sizeof(half2));
+                flash_attn_ext_tbq3_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_tbq3, oob_check>(
                     K_raw + int64_t(k_VKQ_0) * stride_K_bytes, tile_K, stride_K_bytes, k_VKQ_sup);
                 asm volatile("" ::: "memory");
             }
@@ -1061,7 +1078,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int i0_stop = i0_start + 2*nbatch_V2;
 
         if constexpr (nstages <= 1) {
-            if constexpr (!is_tbq4_kv) {
+            if constexpr (!is_tbq_kv) {
                 if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                     const int i0_diff = i0_stop - i0_start;
                     constexpr bool use_cp_async = nstages == 1;
@@ -1078,6 +1095,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 constexpr int nthreads_tbq4 = nwarps * ggml_cuda_get_physical_warp_size();
                 const int stride_V_bytes = stride_V * int(sizeof(half2));
                 flash_attn_ext_tbq4_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_tbq4, oob_check>(
+                    V_raw + int64_t(k_VKQ_0) * stride_V_bytes, tile_V, stride_V_bytes, k_VKQ_sup);
+                asm volatile("" ::: "memory");
+                __syncthreads();
+            } else if constexpr (type_V == GGML_TYPE_TBQ3_0) {
+                asm volatile("" ::: "memory");
+                const char * V_raw = (const char *)V_h2;
+                constexpr int nthreads_tbq3 = nwarps * ggml_cuda_get_physical_warp_size();
+                const int stride_V_bytes = stride_V * int(sizeof(half2));
+                flash_attn_ext_tbq3_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_tbq3, oob_check>(
                     V_raw + int64_t(k_VKQ_0) * stride_V_bytes, tile_V, stride_V_bytes, k_VKQ_sup);
                 asm volatile("" ::: "memory");
                 __syncthreads();
@@ -1275,8 +1301,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols);
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
+    constexpr bool is_tbq3_kv      = (type_K == GGML_TYPE_TBQ3_0 || type_V == GGML_TYPE_TBQ3_0);
     constexpr bool is_tbq4_kv      = (type_K == GGML_TYPE_TBQ4_0 || type_V == GGML_TYPE_TBQ4_0);
-    constexpr int  nstages         = is_tbq4_kv ? ggml_cuda_fattn_mma_get_nstages_tbq4(DKQ, DV, ncols) : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr bool is_tbq_kv       = is_tbq3_kv || is_tbq4_kv;
+    // TBQ3 always uses the synchronous path (nstages=0): the nstages=2 raw-byte
+    // staging pipeline is TBQ4-specific (66 B rows, int-granular copy) and TBQ3's
+    // 50 B rows have no aligned staging port. The shipped TBQ4_KV_FUSED config
+    // forces nstages=0 for the TBQ path anyway.
+    constexpr int  nstages         = is_tbq_kv
+        ? (is_tbq3_kv ? 0 : ggml_cuda_fattn_mma_get_nstages_tbq4(DKQ, DV, ncols))
+        : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;

@@ -58,20 +58,6 @@ static __device__ __forceinline__ void tbq3_fwht_128(float * x) {
     }
 }
 
-static __device__ __forceinline__ void tbq3_fwht_128_shared(float * x) {
-    for (int len = 1; len < 128; len <<= 1) {
-        for (int i = 0; i < 128; i += 2 * len) {
-            for (int j = 0; j < len; j++) {
-                float u = x[i + j];
-                float v = x[i + j + len];
-                x[i + j] = u + v;
-                x[i + j + len] = u - v;
-            }
-        }
-        __syncthreads();
-    }
-}
-
 // ── FWHT rotation (forward / inverse) ──────────────────────────────────────
 
 static __device__ __forceinline__ void tbq3_rotate_forward(
@@ -183,39 +169,74 @@ static __device__ __forceinline__ float dequantize_tbq3_0(
 }
 
 // ── Full-block dequant with inverse FWHT (for CPY/attention) ───────────────
+// Inverts quantize_f32_tbq3_0_block: centroid lookup -> s2 sign -> FWHT -> s1 sign -> x inv_sqrt_128 -> x norm.
+// block_tbq3_0 layout: {ggml_half d, uint8_t qs[48]} = 50 bytes total.
 
 static __global__ void k_tbq3_dequant_full(
-    const uint8_t * __restrict__ qs, float * __restrict__ y, int64_t k
+    const uint8_t * __restrict__ src, float * __restrict__ y, int64_t k
 ) {
     const int tid = threadIdx.x;
     const int block_idx = blockIdx.x;
 
     __shared__ float shared[QK_TBQ3];
 
-    // Read fp16 norm from end of block
-    const ggml_half * d = (const ggml_half *)(qs + block_idx * QK_TBQ3 / 2); // wrong offset
-    // Actually: block size = QK_TBQ3 * 3 / 8 = 48 bytes + 2 bytes norm = 50 bytes
-    const uint8_t * block_qs = qs + block_idx * (QK_TBQ3 * 3 / 8 + sizeof(ggml_half));
-    const ggml_half * block_d = (const ggml_half *)(block_qs + QK_TBQ3 * 3 / 8);
+    constexpr int block_size = sizeof(ggml_half) + QK_TBQ3 * 3 / 8; // 50
+    const uint8_t * block_start = src + block_idx * block_size;
+    const ggml_half * block_d = (const ggml_half *)block_start;
+    const uint8_t * block_qs = block_start + sizeof(ggml_half);
     const float norm_corrected = __half2float(*block_d);
 
-    // Unpack 3-bit values
-    float scale_down = 1.0f / sqrtf((float)QK_TBQ3);
     int base_byte = (tid / 8) * 3;
     int bit_offset = (tid % 8) * 3;
     uint32_t packed = (uint32_t)block_qs[base_byte]
                     | ((uint32_t)block_qs[base_byte + 1] << 8)
                     | ((uint32_t)block_qs[base_byte + 2] << 16);
     uint8_t idx = (packed >> bit_offset) & 0x7;
-    shared[tid] = tbq3_centroids_3bit[idx];
 
+    // inverse rotation: s2 sign, then FWHT, then s1 sign, then ×inv_sqrt_128
+    // (d = norm/recon_norm assumes norm-preserving rotation; unnormalized FWHT scales by sqrt(128))
+    // Race-free butterfly (same pattern as k_tbq4_dequant_full): stages h=1..16 via
+    // warp shuffle, h=32/64 via per-thread shared slots with barriers. The previous
+    // all-threads-in-place shared FWHT raced across warps and produced garbage.
+    float val = tbq3_centroids_3bit[idx] * wht_signs2_tbq3[tid];
+
+    #pragma unroll
+    for (int h = 1; h <= 16; h *= 2) {
+        float partner = __shfl_xor_sync(0xFFFFFFFF, val, h, 32);
+        if ((tid & h) == 0) {
+            val = val + partner;   // lower partner
+        } else {
+            val = partner - val;   // upper partner
+        }
+    }
+
+    // Stage 5 (h=32): cross-warp — shared memory
+    shared[tid] = val;
+    __syncthreads();
+    {
+        float partner = shared[tid ^ 32];
+        if ((tid & 32) == 0) {
+            val = val + partner;
+        } else {
+            val = partner - val;
+        }
+    }
     __syncthreads();
 
-    // Inverse FWHT via shared memory butterfly
-    tbq3_fwht_128_shared(shared);
+    // Stage 6 (h=64): cross-warp — shared memory
+    shared[tid] = val;
+    __syncthreads();
+    {
+        float partner = shared[tid ^ 64];
+        if ((tid & 64) == 0) {
+            val = val + partner;
+        } else {
+            val = partner - val;
+        }
+    }
 
-    // Normalize result
-    y[block_idx * QK_TBQ3 + tid] = shared[tid] * norm_corrected;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    y[block_idx * QK_TBQ3 + tid] = val * wht_signs1_tbq3[tid] * inv_sqrt_128 * norm_corrected;
 }
 
 static void tbq3_dequant_full_cuda(
