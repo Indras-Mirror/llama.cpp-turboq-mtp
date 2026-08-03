@@ -39,8 +39,23 @@ Prefill (1016-tok, n_pred 1): TBQ3 117.98 t/s (corrected — broken build
 overreported 153.58); TBQ4 110-115 t/s. DSpark short-burst 2+2: 10.33 t/s
 (accept 0.76) — CPU draft helps short bursts only.
 
+## q4_0 vs TBQ4 (added 2026-08-03 — same fork binary, same 133KB sample, KV type the only delta)
+| KV | PPL | 256k gen (200t) | prefill (1016t) | KV @256k |
+|---|---|---|---|---|
+| q4_0 | **1.6296** ± 0.018 | **11.84 t/s** | 120.06 t/s | ~6.0 GiB (computed: 43×2×512 vals × 4.5 bits) |
+| tbq4_0 | 1.6387 ± 0.018 | 9.42 t/s | 110-115 t/s | **3.2 GiB** (measured) |
+
+- Quality: statistically equal (Δ 0.009 inside ±0.018). Both +2% vs q8_0 (1.5970).
+- Speed: q4_0 ~26% faster at 256k gen (single-run each — direction consistent with
+  q4_0's simpler decode; treat ±10-15% noise).
+- Compression: TBQ4 ~47% smaller KV (3.2 vs ~6 GiB @256k; ~2.4 vs 4.5 bits/value).
+- **Reading:** at 256k q4_0 wins (faster, equal PPL, RAM not a constraint).
+  TBQ4 wins when KV RAM matters (512k-1M ctx: q4_0 @1M ≈ 24 GiB vs TBQ4 ≈ 12.8 GiB).
+
 ## Verdict
-1. **Best 256k config: TBQ4 KV, no draft — 9.42 t/s, PPL 1.6387.**
+1. **Best 256k config: TBQ4 KV, no draft — 9.42 t/s, PPL 1.6387**
+   (vs q4_0: 11.84 t/s, PPL 1.6296 — q4_0 is the faster daily pick at 256k;
+   TBQ4 is the KV-compact choice for 512k+; default wrapper: TBQ4 @ 256k).
 2. TBQ3 is now correct + functional (was broken) but: −16% gen speed
    (7.87 vs 9.42), +11.8% PPL vs TBQ4, and its Q2_K draft config OOMs this rig.
 3. Drafters (both lose on sustained gen): DSpark Q2_K 7.92, MTP Q8_0 4.33.
