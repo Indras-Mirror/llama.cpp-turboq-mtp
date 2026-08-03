@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <vector>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -516,6 +517,170 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
 
+// DSpark drafter recipe mapping (alessandrobologna conversion, arch
+// 'deepseek_v4_flash_dspark_draft' aliased to LLM_ARCH_DFLASH in llama-arch.cpp).
+//
+// The drafter GGUF carries only dspark.* metadata (no llama.*/deepseek4.* keys, no
+// tokenizer) and 81 dspark.* tensors. The DSV4 DFlash loader (dflash.cpp) expects
+// factored DSV4 tensor names (blk.N.*, fc, enc.output_norm, ...) and the standard
+// deepseek4-style dflash.* hparams. This function:
+//   - synthesizes the required dflash.* metadata from the dspark.* keys + tensor shapes,
+//   - renames the tensors to the loader-expected names (mechanical prefix rewrite for
+//     the per-layer blk.N.* set, plus a small per-tensor table for the top-level ones),
+//   - declares a no_vocab tokenizer so the vocab loader builds n_vocab dummy tokens
+//     (the drafter shares the target model's vocab; only the size matters for shapes).
+static void llama_model_loader_apply_dspark_mapping(
+        struct gguf_context * ctx,
+        std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer> & weights_map) {
+
+    const auto has_tensor = [&](const char * name) -> const ggml_tensor * {
+        auto it = weights_map.find(name);
+        return it == weights_map.end() ? nullptr : it->second.tensor;
+    };
+
+    const int n_layer_kid = gguf_find_key(ctx, "dspark.layer_count");
+    const uint32_t n_layer = n_layer_kid >= 0 ? gguf_get_val_u32(ctx, n_layer_kid) : 3;
+
+    // derive structural hparams from the drafter's tensor shapes (DeepSeek-V4-Flash layout)
+    const ggml_tensor * t_norm    = has_tensor("dspark.norm.weight");
+    const ggml_tensor * t_q_b     = has_tensor("dspark.0.attn_q_b.weight");
+    const ggml_tensor * t_kv      = has_tensor("dspark.0.attn_kv.weight");
+    const ggml_tensor * t_q_a     = has_tensor("dspark.0.attn_q_a.weight");
+    const ggml_tensor * t_out_a   = has_tensor("dspark.0.attn_output_a.weight");
+    const ggml_tensor * t_hc      = has_tensor("dspark.0.hc_attn_fn.weight");
+    const ggml_tensor * t_gate_ex = has_tensor("dspark.0.ffn_gate_exps.weight");
+    const ggml_tensor * t_shexp   = has_tensor("dspark.0.ffn_gate_shexp.weight");
+    const ggml_tensor * t_markov  = has_tensor("dspark.markov_w1.weight");
+
+    const uint32_t n_embd    = t_norm    ? t_norm->ne[0]    : 4096;
+    const uint32_t kv_dim    = t_kv      ? t_kv->ne[1]      : 512;
+    const uint32_t n_head    = (t_q_b && t_kv) ? t_q_b->ne[1] / t_kv->ne[1] : 64;
+    const uint32_t q_lora    = t_q_a     ? t_q_a->ne[1]     : 1024;
+    const uint32_t o_groups  = (t_out_a && n_head > 0 && kv_dim > 0) ? (n_head*kv_dim)/t_out_a->ne[0] : 8;
+    const uint32_t o_lora    = (t_out_a && o_groups > 0) ? t_out_a->ne[1] / o_groups : 1024;
+    const uint32_t hc_mult   = (t_hc && n_embd > 0) ? t_hc->ne[0] / n_embd : 4;
+    const uint32_t n_ff_exp  = t_gate_ex ? t_gate_ex->ne[1] : 2048;
+    const uint32_t n_expert  = t_gate_ex ? t_gate_ex->ne[2] : 256;
+    const uint32_t n_shared  = (t_shexp && n_ff_exp > 0) ? t_shexp->ne[1] / n_ff_exp : 1;
+    const uint32_t n_vocab   = t_markov ? t_markov->ne[1]  : 129280;
+
+    const auto dspark_u32 = [&](const char * key, uint32_t fallback) {
+        const int kid = gguf_find_key(ctx, key);
+        return kid >= 0 ? gguf_get_val_u32(ctx, kid) : fallback;
+    };
+    const uint32_t block_size = dspark_u32("dspark.block_size", 5);
+
+    const auto add_u32  = [&](const char * key, uint32_t val) { if (gguf_find_key(ctx, key) < 0) gguf_set_val_u32(ctx, key, val); };
+    const auto add_f32  = [&](const char * key, float val)    { if (gguf_find_key(ctx, key) < 0) gguf_set_val_f32(ctx, key, val); };
+    const auto add_bool = [&](const char * key, bool val)     { if (gguf_find_key(ctx, key) < 0) gguf_set_val_bool(ctx, key, val); };
+    const auto add_str  = [&](const char * key, const char * val) { if (gguf_find_key(ctx, key) < 0) gguf_set_val_str(ctx, key, val); };
+    const auto add_arr_i32 = [&](const char * key, const std::vector<int32_t> & vals) {
+        if (gguf_find_key(ctx, key) < 0 && !vals.empty()) gguf_set_arr_data(ctx, key, GGUF_TYPE_INT32, vals.data(), vals.size());
+    };
+    const auto add_arr_f32 = [&](const char * key, const std::vector<float> & vals) {
+        if (gguf_find_key(ctx, key) < 0 && !vals.empty()) gguf_set_arr_data(ctx, key, GGUF_TYPE_FLOAT32, vals.data(), vals.size());
+    };
+
+    // generic hparams required by llama_model_base::load_hparams
+    add_u32("dflash.context_length", 4096);
+    add_u32("dflash.embedding_length", n_embd);
+    add_u32("dflash.block_count", n_layer);
+    add_u32("dflash.feed_forward_length", n_ff_exp);
+    add_u32("dflash.expert_count", n_expert);
+    add_u32("dflash.expert_used_count", 6);
+    // DSV4 DFlash loader hparams (dflash.cpp DSV4 branch) - DeepSeek-V4-Flash constants
+    add_u32("dflash.expert_feed_forward_length", n_ff_exp);
+    add_u32("dflash.expert_shared_count", n_shared);
+    add_f32("dflash.expert_weights_scale", 1.5f);
+    add_bool("dflash.expert_weights_norm", true);
+    add_u32("dflash.expert_gating_func", 4); // LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS
+    add_u32("dflash.attention.head_count", n_head);
+    add_u32("dflash.attention.head_count_kv", 1);
+    add_u32("dflash.attention.key_length", kv_dim);
+    add_u32("dflash.attention.value_length", kv_dim);
+    add_f32("dflash.attention.layer_norm_rms_epsilon", 1e-6f);
+    add_u32("dflash.attention.q_lora_rank", q_lora);
+    add_u32("dflash.attention.sliding_window", 128);
+    add_u32("dflash.attention.output_group_count", o_groups);
+    add_u32("dflash.attention.output_lora_rank", o_lora);
+    add_arr_i32("dflash.attention.compress_ratios", std::vector<int32_t>(n_layer, 0));
+    add_u32("dflash.hyper_connection.count", hc_mult);
+    add_f32("dflash.hyper_connection.epsilon", 1e-6f);
+    add_u32("dflash.hyper_connection.sinkhorn_iterations", 20);
+    add_u32("dflash.rope.dimension_count", 64);
+    add_f32("dflash.rope.freq_base", 10000.0f);
+    add_str("dflash.rope.scaling.type", "yarn");
+    add_f32("dflash.rope.scaling.factor", 16.0f);
+    add_u32("dflash.rope.scaling.original_context_length", 65536);
+    add_f32("dflash.rope.scaling.yarn_beta_fast", 32.0f);
+    add_f32("dflash.rope.scaling.yarn_beta_slow", 1.0f);
+    add_arr_f32("dflash.swiglu_clamp_exp", std::vector<float>(n_layer, 10.0f));
+    // recipe keys the spec/draft path reads directly
+    add_u32("dflash.block_size", block_size);
+    add_u32("dflash.vocab_size", n_vocab);
+    // tokenizer: the drafter carries no vocab; no_vocab makes the vocab loader build
+    // n_vocab dummy tokens (shape source for the markov head) - the draft shares the
+    // target model's vocab at runtime
+    add_str("tokenizer.ggml.model", "no_vocab");
+    {
+        std::vector<int32_t> ids;
+        const int kid = gguf_find_key(ctx, "dspark.target_layer_ids");
+        if (kid >= 0 && gguf_get_arr_n(ctx, kid) > 0) {
+            const int32_t * data = (const int32_t *) gguf_get_arr_data(ctx, kid);
+            ids.assign(data, data + gguf_get_arr_n(ctx, kid));
+        }
+        if (ids.size() != n_layer) {
+            ids.clear();
+            for (uint32_t i = 0; i < n_layer; ++i) {
+                ids.push_back(i);
+            }
+        }
+        add_arr_i32("dflash.target_layers", ids);
+    }
+
+    // tensor name remapping: dspark.* -> loader-expected names
+    // note: the ggml tensor names are renamed as well - get_mapping_range() and the
+    // mmap buffer path look tensors up by name, so keeping the dspark.* names would
+    // leave the weights without a buffer
+    std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer> remapped;
+    for (auto & it : weights_map) {
+        const std::string & name = it.first;
+        std::string new_name;
+        if (name.rfind("dspark.", 0) == 0) {
+            const std::string rest = name.substr(7); // after "dspark."
+            if (rest.size() >= 2 && rest[0] >= '0' && rest[0] <= '9' && rest[1] == '.') {
+                // mechanical prefix rewrite for per-layer tensors: dspark.N.* -> blk.N.*
+                new_name = "blk." + rest;
+            } else {
+                static const std::map<std::string, std::string> table = {
+                    { "dspark.main_proj.weight",        "fc.weight" },
+                    { "dspark.main_norm.weight",        "enc.output_norm.weight" },
+                    { "dspark.norm.weight",             "output_norm.weight" },
+                    { "dspark.markov_w1.weight",        "markov_w1.weight" },
+                    { "dspark.markov_w2.weight",        "markov_w2.weight" },
+                    { "dspark.confidence_head.weight",  "conf_proj.weight" },
+                    { "dspark.hc_head_fn.weight",       "output_hc_fn.weight" },
+                    { "dspark.hc_head_base.weight",     "output_hc_base.weight" },
+                    { "dspark.hc_head_scale.weight",    "output_hc_scale.weight" },
+                };
+                auto it2 = table.find(name);
+                if (it2 != table.end()) {
+                    new_name = it2->second;
+                }
+            }
+        }
+        if (new_name.empty()) {
+            new_name = name;
+        }
+        ggml_set_name(it.second.tensor, new_name.c_str());
+        remapped.emplace(new_name, std::move(it.second));
+    }
+    weights_map = std::move(remapped);
+
+    LLAMA_LOG_INFO("%s: dspark drafter mapping applied: arch alias -> dflash, %zu tensors remapped, %u layers\n",
+            __func__, weights_map.size(), n_layer);
+}
+
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -692,6 +857,21 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+    }
+
+    // DSpark drafter recipe: any 'dspark.'-prefixed tensor marks the alessandrobologna
+    // conversion - synthesize the loader-required metadata and remap tensor names
+    if (!weights_map.empty()) {
+        bool is_dspark = false;
+        for (const auto & it : weights_map) {
+            if (it.first.rfind("dspark.", 0) == 0) {
+                is_dspark = true;
+                break;
+            }
+        }
+        if (is_dspark) {
+            llama_model_loader_apply_dspark_mapping(metadata, weights_map);
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);

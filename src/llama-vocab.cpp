@@ -1947,6 +1947,16 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 id_to_token.resize(n_tokens);
             }
 
+            // DSpark drafter recipe (dspark.* metadata): the drafter shares the target's
+            // vocab, only the noise/mask token id is meaningful (dspark.noise_token_id)
+            {
+                const int noise_kid = gguf_find_key(ctx, "dspark.noise_token_id");
+                if (noise_kid >= 0) {
+                    special_mask_id = gguf_get_val_u32(ctx, noise_kid);
+                    LLAMA_LOG_INFO("%s: dspark drafter: mask/noise token id = %u\n", __func__, (uint32_t) special_mask_id);
+                }
+            }
+
             return;
         }
 

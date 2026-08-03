@@ -74,6 +74,13 @@ static bool common_speculative_are_compatible(
     const auto vocab_type_dft = llama_vocab_type(vocab_dft);
     SPC_DBG("vocab_type dft: %d\n", vocab_type_dft);
 
+    // DSpark drafter recipe: the drafter GGUF carries no tokenizer (no_vocab -> dummy
+    // tokens sized from the markov head); it shares the target model's vocab at runtime,
+    // so only the vocab size has to match.
+    if (vocab_type_dft == LLAMA_VOCAB_TYPE_NONE) {
+        return llama_vocab_n_tokens(vocab_dft) == llama_vocab_n_tokens(vocab_tgt);
+    }
+
     if (vocab_type_tgt != vocab_type_dft) {
         SPC_WRN("draft model vocab type must match target model to use speculation but "
                 "vocab_type_dft = %d while vocab_type_tgt = %d\n", vocab_type_dft, vocab_type_tgt);

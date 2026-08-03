@@ -933,6 +933,14 @@ llm_arch llm_arch_from_string(const std::string & name) {
         }
     }
 
+    // alessandrobologna DSpark drafter recipe: the extracted auxiliary drafter carries
+    // arch 'deepseek_v4_flash_dspark_draft' + a 'dspark.*' tensor/metadata namespace.
+    // The merged DSV4 DFlash loader (LLM_ARCH_DFLASH, dflash.cpp) handles the graph;
+    // the loader maps the tensors/metadata in llama-model-loader.cpp.
+    if (name == "deepseek_v4_flash_dspark_draft") {
+        return LLM_ARCH_DFLASH;
+    }
+
     return LLM_ARCH_UNKNOWN;
 }
 
