@@ -371,6 +371,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
         case GGML_TYPE_TBQ4_0:
+        case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_PLANAR3_0:
         case GGML_TYPE_ISO3_0:
         case GGML_TYPE_PLANAR4_0:
@@ -476,8 +477,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (K->type == GGML_TYPE_TBQ4_0) {
-        if (V->type != GGML_TYPE_TBQ4_0) {
+    if (K->type == GGML_TYPE_TBQ4_0 || K->type == GGML_TYPE_TBQ3_0) {
+        // K and V must be the same quant type — the fused MMA kernel is
+        // instantiated per type (TBQ4_0 or TBQ3_0) and both sides must match.
+        if (V->type != K->type) {
             return BEST_FATTN_KERNEL_NONE;
         }
         if ((Q->ne[0] != 128 && Q->ne[0] != 256) || V->ne[0] != Q->ne[0]) {
@@ -685,6 +688,81 @@ static void ggml_cuda_flash_attn_ext_mma_tbq4(ggml_backend_cuda_context & ctx, g
     tbq4_rotate_output_cuda((float *) KQV->data, nrows, DV, ctx.stream());
 }
 
+// TBQ3 ncols switch — mirrors the TBQ4 one; dispatches to the TBQ3-instantiated
+// fused MMA kernel (tK=tV=TBQ3_0 in ggml_cuda_flash_attn_ext_mma_tbq4_case).
+template <int DKQ, int DV, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_tbq3_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * Q = dst->src[0];
+
+    if constexpr (ncols2 <= 8) {
+        // 8/ncols2 branch: only for Turing where ncols=8 is valid.
+        // Volta+ requires ncols >= 32, so skip this branch there.
+        if (turing_mma_available(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING && Q->ne[1] <= 8/ncols2) {
+            ggml_cuda_flash_attn_ext_mma_tbq3_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
+    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || Q->ne[1] <= 32/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_tbq3_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_mma_tbq3_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+}
+
+// TBQ3 fused MMA host path — same structure as the TBQ4 one, but pre/post-rotates
+// with the TBQ3 sign arrays (wht_signs1/2_tbq3) and launches the tK=tV=TBQ3_0
+// kernel instantiation. The TBQ3 tile loader dequants centroid*norm in the rotated
+// domain, matching quantize_f32_tbq3_0_block (the DSV4 cache quantizer).
+static void ggml_cuda_flash_attn_ext_mma_tbq3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * KQV  = dst;
+
+    const int DKQ = (int)Q->ne[0];
+    const int DV  = (int)V->ne[0];
+    GGML_ASSERT(DKQ == 128 || DKQ == 256);
+    GGML_ASSERT(DV == DKQ);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const ggml_tensor * mask = dst->src[3];
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // Pre-rotate Q into rotated domain via SEPARATE kernel (avoids nvcc register spill bug)
+    const int64_t nrows = Q->ne[1] * Q->ne[2] * Q->ne[3];
+    tbq3_rotate_input_cuda((float *) Q->data, nrows, DKQ, ctx.stream());
+
+#define TBQ3_DISPATCH_NCOLS1(DKQ_VAL, DV_VAL)                                        \
+    if (use_gqa_opt && gqa_ratio > 4) {                                              \
+        ggml_cuda_flash_attn_ext_mma_tbq3_switch_ncols1<DKQ_VAL, DV_VAL, 8>(ctx, dst); \
+    } else if (use_gqa_opt && gqa_ratio > 2) {                                       \
+        ggml_cuda_flash_attn_ext_mma_tbq3_switch_ncols1<DKQ_VAL, DV_VAL, 4>(ctx, dst); \
+    } else if (use_gqa_opt && gqa_ratio > 1) {                                       \
+        ggml_cuda_flash_attn_ext_mma_tbq3_switch_ncols1<DKQ_VAL, DV_VAL, 2>(ctx, dst); \
+    } else {                                                                         \
+        ggml_cuda_flash_attn_ext_mma_tbq3_switch_ncols1<DKQ_VAL, DV_VAL, 1>(ctx, dst); \
+    }
+
+    if (DKQ == 128) {
+        TBQ3_DISPATCH_NCOLS1(128, 128)
+    } else {
+        TBQ3_DISPATCH_NCOLS1(256, 256)
+    }
+
+#undef TBQ3_DISPATCH_NCOLS1
+
+    // Apply rotate_inverse to the output (rotated-domain → original domain).
+    tbq3_rotate_output_cuda((float *) KQV->data, nrows, DV, ctx.stream());
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
@@ -713,9 +791,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_MMA_TBQ4:
-            ggml_cuda_flash_attn_ext_mma_tbq4(ctx, dst);
+        case BEST_FATTN_KERNEL_MMA_TBQ4: {
+            const ggml_tensor * K_t = dst->src[1];
+            if (K_t->type == GGML_TYPE_TBQ3_0) {
+                ggml_cuda_flash_attn_ext_mma_tbq3(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_tbq4(ctx, dst);
+            }
             break;
+        }
     }
 }
 
