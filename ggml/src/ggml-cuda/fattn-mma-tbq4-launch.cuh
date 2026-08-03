@@ -7,9 +7,13 @@
 
 // TBQ4 fused MMA flash attention launcher.
 // Mirrors the turbo launcher pattern: forces nstages=0, V_is_K_view=false,
-// need_f16_K=false, need_f16_V=false. Raw TBQ4 data passes through to kernel.
+// need_f16_K=false, need_f16_V=false. Raw TBQ data passes through to kernel.
+//
+// The tK/tV template params select the quant type: TBQ4_0 (default) or TBQ3_0.
+// The MMA math is type-agnostic — only the tile loader/dequant and staging row
+// size differ (selected via if constexpr inside flash_attn_ext_f16 / here).
 
-template <int DKQ, int DV, int ncols1, int ncols2>
+template <int DKQ, int DV, int ncols1, int ncols2, ggml_type tK = GGML_TYPE_TBQ4_0, ggml_type tV = GGML_TYPE_TBQ4_0>
 void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
@@ -49,18 +53,17 @@ void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggm
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
 
-    // nbatch_fa is runtime; compute staging size explicitly.
+    // nbatch_fa is runtime; compute staging size explicitly. Row size depends on
+    // the quant type (TBQ4 block = 66 B, TBQ3 block = 50 B).
     const size_t nbytes_shared_staging_actual = nstages > 1
-        ? (size_t)nbatch_fa * (size_t)(((DKQ/128) * sizeof(block_tbq4_0) + 15) & ~15)
+        ? (size_t)nbatch_fa * (size_t)(((DKQ/128) *
+              (tK == GGML_TYPE_TBQ3_0 ? sizeof(block_tbq3_0) : sizeof(block_tbq4_0)) + 15) & ~15)
         : 0;
 
     const size_t nbytes_shared_total = nbytes_shared_base + nbytes_shared_staging_actual;
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
-
-    constexpr ggml_type tK = GGML_TYPE_TBQ4_0;
-    constexpr ggml_type tV = GGML_TYPE_TBQ4_0;
 
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
@@ -96,6 +99,12 @@ void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggm
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
 }
 
+// TBQ3 wrapper: fixed tK=tV=TBQ3_0 instantiation of the fused MMA case.
+template <int DKQ, int DV, int ncols1, int ncols2>
+void ggml_cuda_flash_attn_ext_mma_tbq3_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_flash_attn_ext_mma_tbq4_case<DKQ, DV, ncols1, ncols2, GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ3_0>(ctx, dst);
+}
+
 
 #define DECL_FATTN_MMA_TBQ4_CASE(DKQ, DV, ncols1, ncols2)                              \
     template void ggml_cuda_flash_attn_ext_mma_tbq4_case                                \
@@ -107,6 +116,17 @@ void ggml_cuda_flash_attn_ext_mma_tbq4_case(ggml_backend_cuda_context & ctx, ggm
     extern DECL_FATTN_MMA_TBQ4_CASE(DKQ, DV, (ncols)/ 4,  4); \
     extern DECL_FATTN_MMA_TBQ4_CASE(DKQ, DV, (ncols)/ 8,  8); \
 
+// TBQ3 variant of the fused MMA case — same kernel template, tK=tV=TBQ3_0.
+#define DECL_FATTN_MMA_TBQ3_CASE(DKQ, DV, ncols1, ncols2)                                    \
+    template void ggml_cuda_flash_attn_ext_mma_tbq3_case                                      \
+    <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)             \
+
+#define DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(DKQ, DV, ncols)    \
+    extern DECL_FATTN_MMA_TBQ3_CASE(DKQ, DV, (ncols)/ 1,  1); \
+    extern DECL_FATTN_MMA_TBQ3_CASE(DKQ, DV, (ncols)/ 2,  2); \
+    extern DECL_FATTN_MMA_TBQ3_CASE(DKQ, DV, (ncols)/ 4,  4); \
+    extern DECL_FATTN_MMA_TBQ3_CASE(DKQ, DV, (ncols)/ 8,  8); \
+
 DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(128, 128,  8)
 DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(128, 128, 16)
 DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(128, 128, 32)
@@ -116,3 +136,13 @@ DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(256, 256,  8)
 DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(256, 256, 16)
 DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(256, 256, 32)
 DECL_FATTN_MMA_TBQ4_CASE_ALL_NCOLS2(256, 256, 64)
+
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(128, 128,  8)
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(128, 128, 16)
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(128, 128, 32)
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(128, 128, 64)
+
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(256, 256,  8)
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(256, 256, 16)
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(256, 256, 32)
+DECL_FATTN_MMA_TBQ3_CASE_ALL_NCOLS2(256, 256, 64)

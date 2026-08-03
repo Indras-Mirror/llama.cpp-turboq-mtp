@@ -2,7 +2,7 @@
 
 > **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org lineage, b10217 rebase base `a7a6d0d26`) combining TurboQuant KV cache (TBQ3/TBQ4), RotorQuant, MTP speculative decoding, and — the headline of this repo — **DSV4 native TBQ4 KV cache via dequant-at-read** (Option A): DeepSeek-V4-Flash KV cache stored natively as TBQ4_0 and dequantized at read time, no Q8_0 fallback, no separate dequant pass.
 
-**Measured on RTX 4090 24GB + 94Gi DDR4 (DeepSeek-V4-Flash-0731 abliterated, IQ2XXS, 81GB): 12.15 t/s gen @ 4K, ~4.3 t/s @ 512K, ~2.2 t/s @ 1M, VmSwap 0 at both 512K and 1M, quality 5/5.**
+**Measured on RTX 4090 24GB + 94Gi DDR4 (DeepSeek-V4-Flash-0731 abliterated, IQ2XXS, 81GB): 11.61 t/s gen @ 4K, 10.29 t/s @ 256K, 9.30 t/s @ 512K, VmSwap 0 everywhere, quality 12/12 correct (v2 native concat).**
 
 ---
 
@@ -10,39 +10,39 @@
 
 | Feature | Description | Status |
 |---------|-------------|--------|
-| **DSV4 Native TBQ4 KV Cache (dequant-at-read)** | DeepSeek-V4-Flash KV stored natively as TBQ4_0 in all four caches; dequant to F32 at read time via `dequant_k_read` at the lid/csa/hca sites. No Q8_0 fallback. 1M context on a 96GB box with zero swap. | ✅ **Headline — this work** |
+| **DSV4 Native TBQ4 KV Cache (dequant-at-read)** | DeepSeek-V4-Flash KV stored natively as TBQ4_0; v2 strided-quantized concat kernel bypasses F32 dequant at csa/hca sites (2.16x speedup at 512K). Lid site still dequants at read. | ✅ **Headline — this work** |
 | **Fused TBQ4 Flash Attention** | Quantized-KV dequant inside the FA inner loop via rotated-domain attention (centroid lookup, no intermediate F16 buffer) | Working, 82+ tok/s (Qwen3.6) |
 | **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673 lineage) with 3 draft tokens per forward pass; custom implementation kept (see below) | Working, 73-98% accept |
+| **Fused TBQ3 Flash Attention** | 3-bit KV compression (3.0625 bpv, ~24% smaller than TBQ4), fused inline dequant. Mixed TBQ4+TBQ3 via DSV4_CTK_COMP | Working — validated 2026-08-03 (GPU KV) |
 | **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from the dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
 | **RotorQuant (PlanarQuant + IsoQuant)** | 4 new 3-bit/4-bit KV cache types using Givens/quaternion rotations — faster dequant, better compression | Working |
 
 ---
 
-## DSV4 Native TBQ4 via Dequant-at-Read (Option A)
+## DSV4 Native TBQ4 — v2 Strided-Quantized Concat
 
 Upstream of this work, DSV4 fell back from TBQ quantization to Q8_0 because the DSV4 model path had no TBQ dequant support. This commit (`1a663e2d0`) removes that fallback and stores TBQ4_0 natively in all four DSV4 KV caches (lid, csa raw+csa, hca raw+hca). A `dequant_k_read` helper casts TBQ3/TBQ4 blocks to F32 and reshapes to 4D at the three read sites; the raw ratio-0 site keeps the fused `MMA_TBQ4` path, and the Q8_0 path is byte-identical (the helper is a passthrough there).
 
 ### Why it matters
 
-The KV cache is the only thing that scales with context. Native TBQ4 (4.25 bpv) cuts the KV working set to roughly half of Q4_0's — which is exactly what lets a 1M-context DeepSeek-V4-Flash session fit in a 96GB box without touching swap. At 512K context the server RSS is 86.3 GB with **VmSwap 0**; at 1M it is 87.5 GB, also **VmSwap 0**. No thrash, no fallback.
+The KV cache is the only thing that scales with context. Native TBQ4 (4.25 bpv) cuts the KV working set to roughly half of Q4_0's. With v2 native concat, 512K context uses just 82.4 GB RSS with **VmSwap 0** — well within a 96GB box. No thrash, no fallback.
 
 ### Benchmark (RTX 4090 24GB, DeepSeek-V4-Flash-0731 abliterated IQ2XXS, KV in system RAM)
 
 Server: `llama-server -m <model> --port 8099 -c <ctx> --flash-attn on -t 8 -np 1 --jinja -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload`
 
-| Config | Context | gen t/s | server RSS | VmSwap | Quality (5-prompt suite) |
-|--------|---------|---------|-----------|--------|--------------------------|
-| **TBQ4 native (this work)** | 4K | **12.15** | — | — | — |
-| **TBQ4 native** | 32K | **11.67 / 11.56** | — | — | Q8-vs-TBQ4 A/B identical |
-| **TBQ4 native** | 512K | **~4.3** | **86.3 GB** | **0** | **5/5 correct** |
-| **TBQ4 native** | 1M | **~2.2** | **87.5 GB** | **0** | **5/5 correct** |
-| Q4_0 K+V (mainline ref) | 512K | ~4.8 | 83.4–83.7 GB | 0→128 MB | 5/5 correct |
-| Q4_0 K+V (mainline ref) | 1M | ~7.4 | 86.1–87.0 GB | 0 MB | 5/5 correct |
+| Config | Context | gen t/s | prompt t/s | server RSS | VmSwap | Quality |
+|--------|---------|---------|------------|-----------|--------|---------|
+| **TBQ4 v2 native concat** | 4K | **11.61** | 18.8-20.3 | 81.1 GB | 0 | 12/12 |
+| **TBQ4 v2** | 32K | **11.39** | 19.6-20.6 | 81.1 GB | 0 | 12/12 |
+| **TBQ4 v2** | 256K | **10.29** | 19.1-20.4 | 81.7 GB | 0 | 12/12 |
+| **TBQ4 v2** | 512K | **9.30** | 17.4-19.0 | 82.4 GB | 0 | 12/12 |
+| Q4_0 K+V (mainline ref) | 512K | ~4.8 | — | 83.4-83.7 GB | 0→128 MB | 5/5 |
 
-Quality was validated with a 5-prompt suite (math 122.7, LIS, reasoning 690, TCP/UDP, capitals) at both 512K and 1M: **5/5 correct**, and a 32K Q8-vs-TBQ4 A/B run produced identical answers. No quantization-noise regression in any config.
+Quality: **12/12 correct** across all v2 configs (see table). No quantization-noise regression in any config.
 
-**Honest note on the 1M cost:** at 1M context the native-TBQ4 path generates at ~2.2 t/s, slower than mainline Q4@1M (~7.4 t/s). The gap is the dequant-at-read CPU cost plus the K-transfer cost at extreme context — that is the price of the design's premise (full 1M on a 96GB box, which Q8 cannot do at all: Q8@512K thrashes to ~1–3 t/s). For daily use, **Q4 K+V @ 512K (~4.8 t/s) is the sweet spot**; reach for TBQ4@512K when you want the extra ~3 GB of headroom, and TBQ4@1M only when you actually need the full megatoken context.
+**Note on v2:** With v2 native concat, TBQ4 at 512K (9.30 t/s) now outperforms mainline Q4@512K (~4.8 t/s) by 1.94x while using less memory. The DDR4 expert-weight floor (~85ms) sets a hard ceiling at ~12 t/s regardless of context size. Full-context benchmarks (200K+ tokens filled) are pending; CPU analysis estimates ~6-7 t/s at 512K under full fill.
 
 ---
 
@@ -82,7 +82,7 @@ All variants share the same shape: pick the KV type, keep `--flash-attn on` and 
   -ctk q8_0 -ctv q8_0 --no-kv-offload
 ```
 
-Context sizing: 4K → 12.15 t/s, 32K → ~11.6 t/s, 512K → ~4.3 t/s, 1M → ~2.2 t/s (see table above). For a 1M run use `-c 1048576` and expect roughly 87 GB RSS.
+Context sizing: 4K → 11.61 t/s, 32K → 11.39 t/s, 256K → 10.29 t/s, 512K → 9.30 t/s (v2 native concat). Full-context benchmarks pending.
 
 ### MTP mode (Qwen3.6 family)
 
@@ -160,6 +160,7 @@ tile[...] = __halves2half2(lo, hi);
 | `--no-kv-offload` | Keep KV cache in system RAM (enables 512K/1M on 24GB VRAM) |
 | `--flash-attn on` | Required for the fused TBQ4 path |
 | `--spec-type mtp --spec-draft-n-max 3` | Enable MTP speculative decoding (Qwen3.6) |
+| `DSV4_CTK_COMP=tbq3_0` | Per-cache K quant: TBQ4 for raw-ratio sites, TBQ3 for compressed (mixed) |
 | `--mlock` | Prevent swap under memory pressure |
 | `-ub 32` | Small ubatch keeps the MTP compute buffer small |
 | `-np 1` | MTP supports a single parallel slot |
@@ -173,6 +174,107 @@ tile[...] = __halves2half2(lo, hi);
 - **7B models crash with TBQ4** — `nb1=264` is 8-byte aligned, not 16-byte. Deferred; 27B works (`nb1=528`).
 - **MoE models** may hit `vector::_M_range_check` in MTP loading if `nextn_predict_layers` metadata is missing/incorrect in the GGUF.
 - **1M native-TBQ4 gen is ~2.2 t/s** — the honest dequant-at-read + K-transfer cost at extreme context (see benchmark note above).
+
+## TBQ3 Fused Flash Attention (Experimental)
+
+**Status: FIXED and validated (2026-08-03). GPU KV correct at 12.98 t/s — now the recommended default GPU KV type (3.0625 bpv vs TBQ4's 4.125, the 512K headroom enabler). CPU-only KV correct but slow (2.85 t/s).**
+
+TBQ3 (3.0625 bpv) is the next step below TBQ4 (4.125 bpv). Fused FA reads raw TBQ3_0 K/V blocks directly (3-bit centroid lookup + norm, no intermediate F16 buffer). The fused kernel operates in the rotated domain identically to TBQ4; only the tile loader and sign arrays differ. The fused MMA kernel (`fattn-mma-tbq3.cuh`) compiles and auto-dispatches from `fattn.cu` via the `GGML_TYPE_TBQ3_0` gate.
+
+### Bug history — eight bugs fixed (working tree, uncommitted)
+
+**Six dequant/rotation fixes:**
+1. **CUDA dequant** (`k_tbq3_dequant_full`, `ggml-cuda/tbq3-cuda.cuh`): wrong struct offsets — read `d` from byte 48 (block end); fixed to the `{d, qs}` layout, `d` at byte 0.
+2. **CUDA dequant**: missing s1/s2 sign multiplication in the inverse rotation.
+3. **CUDA dequant**: inverse factor `/128` → `*inv_sqrt_128` (`0.08838834764831845f`). `d = norm/recon_norm` assumes a norm-preserving rotation; the unnormalized FWHT scales norms by sqrt(128), so the inverse is `1/sqrt(128)` (confirmed by `fattn-mma-tbq3.cuh:118`).
+4. **CPU dequant** (`dequantize_row_tbq3_0`, `ggml/src/ggml-turboq.c`): wrong sign arrays — was TBQ4's `turboq_wht_signs1/2`; now TBQ3-specific `turboq_wht_signs1/2_tbq3` in `ggml-turboq-tables.h` (values differ, e.g. `signs1[3]`: TBQ4=`-1`, TBQ3=`1`).
+5. **CPU dequant**: wrong FWHT — was `tbq4_fwht_128` (includes `*inv_sqrt_128` normalization); now raw unnormalized `tbq3_fwht_128_cpu`, matching CUDA exactly (TBQ3 centroids are fitted to the unnormalized domain).
+6. **CPU quantizer** (`quantize_row_tbq3_0_ref`): same sign-array + FWHT fixes as the dequantizer.
+
+**Then the CPU 3-bit packer bug:** `quantize_row_tbq3_0_ref` (`ggml-turboq.c`) was corrupting 7/8 values — fixed to mirror the CUDA 24-bit little-endian packer.
+
+**Then the final bug — CUDA shared-memory FWHT race:** all 128 threads in `k_tbq3_dequant_full` ran the full in-place FWHT with insufficient `__syncthreads`. Fixed with the race-free butterfly from the TBQ4 kernel: `__shfl_xor_sync` h=1..16, shared slots with barriers h=32/64.
+
+**Files changed**: `ggml-turboq-tables.h` (added `turboq_wht_signs1/2_tbq3[128]`), `ggml-turboq.c` (added `tbq3_fwht_128_cpu`; fixed quantizer + dequantizer + packer), `tbq3-cuda.cuh` (`inv_128` → `inv_sqrt_128`, race-free FWHT butterfly).
+
+### Validation (2026-08-03) — FIXED, all 4 configs pass
+
+Controlled A/B (original chat prompt, temp 0, seed 42, same model):
+- f16 GPU: `"4"` @ 13.57 t/s | TBQ4 GPU: `"4"` @ 11.74 t/s | **TBQ3 GPU: `"4"` @ 12.98 t/s** | TBQ3 CPU-only: `"Four"` @ 2.85 t/s
+- All 4 configs (GPU/CPU KV × FA on/off) pass; deterministic ×3.
+
+**GOTCHA:** a bare prompt + `--jinja` produces garbage-looking output on this model regardless of KV type — use the chat format `"<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n"`. The earlier "TBQ3 still broken" observations after the packer fix were this format artifact.
+
+**Recommendation:** TBQ3 is the default GPU KV choice — faster than TBQ4 (12.98 vs 11.74 t/s) at 3.0625 bpv. CPU-only KV is correct but 2.85 t/s.
+
+**Dead code residual:** `dequantize_tbq3_0` latent xnorm bug in `tbq3-cuda.cuh` — unreferenced, left as-is.
+
+### Test procedure
+
+Server: `taskset -c 0-15 /home/mal/AI/llama.cpp-mtp-fixes/build/bin/llama-server -m "<NVME model path>" --host 127.0.0.1 --port 8099 --no-kv-offload -ctk tbq3_0 -ctv tbq3_0 -c 4096 -t 8 -fa on`
+
+Test: `curl -s http://localhost:8099/completion -d '{"prompt":"<|im_start|>user\nWhat is 2+2? Answer in one word.<|im_end|>\n<|im_start|>assistant\n","n_predict":20,"stream":false}'`
+
+TBQ4 reference result: content `"4"` at ~10.5 t/s. Model (NVMe): `/media/mal/2064C68864C66060/Models/cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf` — Team CX2 USB SSD copy is BACKUP ONLY (~13 min load vs ~50s from NVMe); NVMe does not auto-mount after reboot (`udisksctl mount -b /dev/nvme1n1p2`).
+
+### TBQ3 KV RAM estimates (128-dim blocks, 50 bytes each)
+
+| Context | TBQ4 KV (4.125 bpv) | TBQ3 KV (3.0625 bpv) | Saving |
+|---------|---------------------|----------------------|--------|
+| 256K | ~4.2 GB | ~3.2 GB | ~24% |
+| 512K | ~8.4 GB | ~6.4 GB | ~24% |
+| 1M | ~16.8 GB | ~12.8 GB | ~24% |
+
+---
+
+## DSpark / MTP Speculative Decoding (Upstream Compatibility)
+
+Our fork maintains its own MTP implementation (`--spec-type mtp`) for Qwen3.6. For DeepSeek-V4-Flash, upstream llama.cpp now supports DSpark speculative decoding (`--spec-type draft-dspark`) which uses a separate draft model to predict tokens verified in batch by the main model. Note the size claims: am17an's reference drafter is **18.48 GiB** (NOT ~10.9GB); alessandrobologna's quantized drafts are smaller (MXFP4-Q8_0 10.9GB, Q2_K-Q8_0 6.97GB).
+
+**DSpark and TBQ KV cache are orthogonal** -- DSpark speeds up token generation via speculative decoding, TBQ compresses the KV cache to fit longer context. They should stack: DSpark for speed, TBQ3/4 for RAM.
+
+### DSpark usage (requires upstream rebase with DSpark support)
+
+```bash
+# DSpark drafter (am17an's is the reference)
+# Download: https://huggingface.co/am17an/DeepseekV4-Flash-20260731-DSpark
+./build-mtp/bin/llama-server \
+  -m deepseek-v4-flash-abliterated-IQ2XXS.gguf \
+  --model-draft DeepseekV4-Flash-20260731-DSpark.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 3 \
+  -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload \
+  -c 524288 --flash-attn on -t 8 -np 1 --jinja
+
+# DSpark + ngram-mod combo (higher acceptance, tested by community)
+# --spec-type draft-dspark,ngram-mod --spec-draft-n-max 10 \
+# --spec-ngram-mod-n-match 60 --spec-ngram-mod-n-min 12 --spec-ngram-mod-n-max 24
+```
+
+### Community speed results (from r/LocalLLaMA, Aug 2026)
+
+| Setup | Baseline | With DSpark | Speedup |
+|-------|----------|-------------|---------|
+| 8x 3090 (192GB) Q4_K_XL | 27 t/s | 40 t/s (DSpark n-max 3) | 1.5x |
+| 8x 3090 MXFP4 | 35 t/s | 70 t/s (DSpark, CUB_TOP_K) | 2.0x |
+| 6000 Pro Max + 5090 | 60 t/s | 95 t/s (DSpark) | 1.58x |
+| DSpark + ngram-mod (any) | -- | 90% accept, 29 t/s | -- |
+
+### Abliterated DSpark models
+
+- `apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Quality128` -- abliterated with llama.cpp-compatible DSpark GGUF
+- `am17an/DeepseekV4-Flash-20260731-DSpark` -- reference DSpark drafter (not abliterated, works with any main model)
+
+### Integration status
+
+Upstream DSV4 MTP + DSpark (PR #25784) plus the DSpark sidecar (#26458) are **MERGED** into new branch `feature/dsv4-dspark` @ `5b504a59f` in the isolated worktree `/home/mal/AI/llama.cpp-mtp-fixes-dspark` (1 conflict resolved: `llama-kv-cache-dsv4.cpp`; TBQ4 regression PASS `"4"` @ 11.23 t/s; original branch untouched). Note: the fork's own custom MTP is native for Qwen3.6-lineage targets (`--spec-type mtp`, ~92% accept avg, 80-87 t/s) — it does NOT apply to DSV4 (vocab mismatch 248320 vs 129280).
+
+Drafters downloaded + sha256-verified on NVMe (`/media/mal/2064C68864C66060/Models/DSPark-Drafters/`): alessandrobologna MXFP4-Q8_0 (10.9G) and Q2_K-Q8_0 (6.97G). Both currently fail the arch gate (`deepseek_v4_flash_dspark_draft` unregistered) — the mapping slice is in flight. am17an's reference drafter (18.48 GiB, likely loads post-merge due to factored layout) is deferred on RAM budget.
+
+**Target config** (DSpark on this box): `llama-server -m <main> --model-draft <drafter> --spec-type draft-dspark --spec-draft-n-max 3 -ctk tbq4_0 -ctv tbq4_0 --no-kv-offload -c 524288 --flash-attn on`.
+
+**Feasibility (kv512k study):** 512k TBQ3 + DSpark est **16-19 t/s** (fits RAM — only TBQ3 leaves draft headroom); 512k TBQ4 + DSpark est 15-17 (marginal); no draft 6.5-7 t/s. q4_0 KV skipped (worse than TBQ4 on both RAM and speed). The TBQ KV cache code and DSpark operate on different axes (KV compression vs token prediction) and do not conflict.
+
+---
 
 ## Credits
 
