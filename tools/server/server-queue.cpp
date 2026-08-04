@@ -99,6 +99,26 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
+std::vector<int> server_queue::get_pending_task_ids() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    std::vector<int> ids;
+    for (const auto & task : queue_tasks) {
+        ids.push_back(task.id);
+    }
+    for (const auto & task : queue_tasks_deferred) {
+        ids.push_back(task.id);
+    }
+    return ids;
+}
+
+void server_queue::clear_all_tasks() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    queue_tasks.clear();
+    queue_tasks_deferred.clear();
+    time_last_task = ggml_time_ms();
+    condition_tasks.notify_one();
+}
+
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!sleeping) {
