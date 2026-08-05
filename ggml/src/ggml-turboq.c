@@ -517,6 +517,17 @@ static void unpack_3bit(uint8_t * indices, const uint8_t * src, int64_t n) {
 
 static void tbq4_fwht_128(float * x); // forward decl — defined below in TBQ4_0 section
 
+static void tbq3_fwht_128_cpu(float * x) {
+    for (int h = 1; h < 128; h *= 2) {
+        for (int i = 0; i < 128; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j] = a + b; x[j + h] = a - b;
+            }
+        }
+    }
+}
+
 void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TBQ3 == 0);
     const int64_t nb = k / QK_TBQ3;
@@ -529,11 +540,11 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
         float norm = sqrtf(norm_sq);
         if (norm < 1e-10f) norm = 1e-10f;
 
-        // Normalize + FWHT rotation (s1 + FWHT + s2, seed=42)
+        // Normalize + FWHT rotation (s1 + unnormalized FWHT + s2, TBQ3-specific signs)
         float rotated[QK_TBQ3];
-        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] = xb[j] / norm * turboq_wht_signs1[j];
-        tbq4_fwht_128(rotated);
-        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs2[j];
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] = xb[j] / norm * turboq_wht_signs1_tbq3[j];
+        tbq3_fwht_128_cpu(rotated);
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs2_tbq3[j];
 
         // 3-bit quantize via binary search over FWHT centroids
         uint8_t indices[QK_TBQ3];
@@ -551,14 +562,22 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
             indices[j] = idx;
         }
 
-        // Pack 8 × 3-bit values into 3 bytes
+        // Pack 8 x 3-bit values into 3 bytes (little-endian 24-bit group,
+        // mirror of quantize_f32_tbq3_0_block in tbq3-cuda.cuh)
         memset(y[b].qs, 0, QK_TBQ3 * 3 / 8);
-        for (int j = 0; j < QK_TBQ3; j++) {
-            // Repack: 8 values per 3 bytes, little-endian bit packing
-            int block = j / 8;
-            int bit = (j % 8) * 3;
-            y[b].qs[block * 3 + 0] |= (indices[j] & 0x7) << (bit < 8 ? bit : 0);
-            if (bit >= 8) y[b].qs[block * 3 + 1] |= ((indices[j] >> (8 - bit)) & 0x7);
+        for (int j = 0; j < QK_TBQ3 / 8; j++) {
+            int base = j * 8;
+            uint32_t packed = (uint32_t)indices[base + 0]
+                            | ((uint32_t)indices[base + 1] << 3)
+                            | ((uint32_t)indices[base + 2] << 6)
+                            | ((uint32_t)indices[base + 3] << 9)
+                            | ((uint32_t)indices[base + 4] << 12)
+                            | ((uint32_t)indices[base + 5] << 15)
+                            | ((uint32_t)indices[base + 6] << 18)
+                            | ((uint32_t)indices[base + 7] << 21);
+            y[b].qs[j * 3 + 0] = (uint8_t)(packed & 0xFF);
+            y[b].qs[j * 3 + 1] = (uint8_t)((packed >> 8) & 0xFF);
+            y[b].qs[j * 3 + 2] = (uint8_t)((packed >> 16) & 0xFF);
         }
 
         // Norm correction: corrected = original / reconstruction norm
@@ -596,13 +615,15 @@ void dequantize_row_tbq3_0(const block_tbq3_0 * GGML_RESTRICT x, float * GGML_RE
             rotated[j] = turboq_fwht_centroids_3bit[idx];
         }
 
-        // Inverse FWHT
-        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs2[j];
-        tbq4_fwht_128(rotated);
-        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs1[j];
+        // Inverse FWHT (TBQ3-specific signs + unnormalized FWHT + /128)
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs2_tbq3[j];
+        tbq3_fwht_128_cpu(rotated);
+        for (int j = 0; j < QK_TBQ3; ++j) rotated[j] *= turboq_wht_signs1_tbq3[j];
 
-        // Scale by corrected norm
-        for (int j = 0; j < QK_TBQ3; ++j) y[b * QK_TBQ3 + j] = rotated[j] * norm_corrected;
+        // Scale by corrected norm; inv_sqrt_128 normalizes the unnormalized FWHT
+        // (d = norm/recon_norm assumes normalized rotation; FWHT scales norms by sqrt(128))
+        const float inv_sqrt_128 = 0.08838834764831845f;
+        for (int j = 0; j < QK_TBQ3; ++j) y[b * QK_TBQ3 + j] = rotated[j] * inv_sqrt_128 * norm_corrected;
     }
 }
 
