@@ -2058,7 +2058,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GATED_DELTA_NET_PIPE:
             {
                 GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is CUDA-only (fused DeltaNet chunk pipeline); GDN models require GPU layers (e.g. -ngl 99)\n");
-            } break;
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
