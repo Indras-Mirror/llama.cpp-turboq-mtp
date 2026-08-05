@@ -2354,7 +2354,9 @@ public:
 #ifdef GGML_USE_CUDA
             , sched(sched)
 #endif
-    {}
+    {
+        GGML_UNUSED(sched);
+    }
 
     ~llama_io_write_host_async() {
 #ifdef GGML_USE_CUDA
