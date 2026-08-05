@@ -554,7 +554,6 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
         // Pack 8 × 3-bit values into 3 bytes
         memset(y[b].qs, 0, QK_TBQ3 * 3 / 8);
         for (int j = 0; j < QK_TBQ3; j++) {
-            int byte_off = (j / 8) * 3 + (j % 8) / 8 * 0; // simplified: j/8*3
             // Repack: 8 values per 3 bytes, little-endian bit packing
             int block = j / 8;
             int bit = (j % 8) * 3;
