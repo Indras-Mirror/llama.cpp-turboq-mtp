@@ -637,6 +637,24 @@ const func_builtins & value_string_t::get_builtins() const {
                 return mk_val<value_string>(args.get_pos(0)->as_string().strip(true, false, val_chars->as_string().str()));
             }
         }},
+        {"rstrip", [](const func_args & args) -> value {
+            args.ensure_vals<value_string>();
+            value val_chars = args.get_kwarg_or_pos("chars", 1);
+            if (val_chars->is_undefined()) {
+                return mk_val<value_string>(args.get_pos(0)->as_string().strip(false, true));
+            } else {
+                return mk_val<value_string>(args.get_pos(0)->as_string().strip(false, true, val_chars->as_string().str()));
+            }
+        }},
+        {"lstrip", [](const func_args & args) -> value {
+            args.ensure_vals<value_string>();
+            value val_chars = args.get_kwarg_or_pos("chars", 1);
+            if (val_chars->is_undefined()) {
+                return mk_val<value_string>(args.get_pos(0)->as_string().strip(true, false));
+            } else {
+                return mk_val<value_string>(args.get_pos(0)->as_string().strip(true, false, val_chars->as_string().str()));
+            }
+        }},
         {"title", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             jinja::string str = args.get_pos(0)->as_string().titlecase();
