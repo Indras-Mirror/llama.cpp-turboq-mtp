@@ -408,6 +408,9 @@ enum projector_type {
     PROJECTOR_TYPE_MINIMAX_M3,
     PROJECTOR_TYPE_GRANITE4_VISION,
     PROJECTOR_TYPE_MIMO_AUDIO,
+    PROJECTOR_TYPE_QWEN3TTS_SPKENC,
+    PROJECTOR_TYPE_QWEN3TTS_GEN,
+    PROJECTOR_TYPE_MUSE_GLIMMER,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -465,6 +468,9 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GRANITE4_VISION,   "granite4_vision"},
     { PROJECTOR_TYPE_MIMO_AUDIO,        "mimo_audio"},
     { PROJECTOR_TYPE_PARAKEET,          "parakeet"},
+    { PROJECTOR_TYPE_QWEN3TTS_SPKENC,   "qwen3tts_spkenc"},
+    { PROJECTOR_TYPE_QWEN3TTS_GEN,      "qwen3tts_gen"},
+    { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
