@@ -1110,9 +1110,12 @@ json oaicompat_chat_params_parse(
     // so n_past is large, checkpoints can be restored, and only the delta
     // (new tokens) gets processed instead of a full prefill reload.
     {
-        const size_t margin = std::max<int>(
-            opt.reasoning_budget + 8192,   // reasoning budget + tool calls/output
-            8192);                          // minimum safe margin
+        // reserve at most 1/4 of the context for reasoning/tool output; on small
+        // contexts the fixed 8K margin would consume the whole window (budget -> 0
+        // and every request trims the full conversation)
+        const size_t margin = std::min<size_t>(
+                std::max<int>(opt.reasoning_budget + 8192, 8192),
+                std::max<size_t>(1, opt.n_ctx) / 4);
         const size_t budget = std::max<size_t>(1, opt.n_ctx) - margin;
 
         auto estimate_msg_tokens = [](const common_chat_msg & msg) -> size_t {
