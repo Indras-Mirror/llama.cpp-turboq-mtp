@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -437,6 +438,26 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // TBQ KV on a backend without a fused TBQ FA kernel (Metal): the attention
+    // fallback dequantizes in the WHT-rotated domain, so the rotation inputs
+    // must carry the codec's signed matrices (R for Q, R^T for the V output).
+    if (memory) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (hybrid) {
+            llama_kv_cache * kv = hybrid->get_mem_attn();
+            if (kv && (kv->type_k() == GGML_TYPE_TBQ3_0 || kv->type_k() == GGML_TYPE_TBQ4_0 ||
+                       kv->type_v() == GGML_TYPE_TBQ3_0 || kv->type_v() == GGML_TYPE_TBQ4_0)) {
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched.get()); i++) {
+                    const ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), i);
+                    if (be && strncmp(ggml_backend_name(be), "Metal", 5) == 0) {
+                        kv->set_attn_rot_signed(true);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {

@@ -208,6 +208,10 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // select signed (TBQ-codec-domain) rotation matrices for the rot inputs;
+    // set by llama_context when TBQ KV runs on a backend without a fused kernel
+    void set_attn_rot_signed(bool v) { attn_rot_signed = v; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -246,6 +250,15 @@ private:
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // signed rotation matrices for TBQ KV on backends without a fused TBQ FA
+    // kernel (Metal): the TBQ codec stores values rotated by R = s1*H*s2, so
+    // attention must pre-rotate Q by R and post-rotate the V output by R^T.
+    // Only built for head size 128 (QK_TBQ4); otherwise the plain Hadamard
+    // path (original-domain dequant) is used.
+    bool attn_rot_signed = false;
+    std::unordered_map<int64_t, std::vector<float>> attn_rot_signed_k;
+    std::unordered_map<int64_t, std::vector<float>> attn_rot_signed_v;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;

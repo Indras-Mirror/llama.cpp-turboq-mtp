@@ -1857,6 +1857,12 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
 
+    // op_params[0] == 1 on a TBQ source selects the rotated-domain dequant
+    // kernels (attention fallback on backends without a fused TBQ FA kernel)
+    if (op->op_params[0] == 1 && (op->src[0]->type == GGML_TYPE_TBQ3_0 || op->src[0]->type == GGML_TYPE_TBQ4_0)) {
+        pipeline = ggml_metal_library_get_pipeline_cpy_rot(lib, op->src[0]->type, op->type);
+    }
+
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
 
     int64_t nk0 = ne00;

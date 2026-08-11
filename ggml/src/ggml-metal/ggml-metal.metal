@@ -7617,6 +7617,44 @@ void dequantize_tbq3_0(device const block_tbq3_0 * xb, short il, thread type4x4 
     reg = (type4x4) reg_f;
 }
 
+// Rotated-domain dequant: centroid * d only, no inverse WHT. The stored values
+// are in the codec's WHT-rotated domain; with Q pre-rotated by the same signed
+// rotation (see llama_kv_cache::attn_rot_signed), attention runs entirely in
+// the rotated domain and the per-thread butterfly is eliminated entirely.
+template <typename type4x4>
+void dequantize_tbq4_0_rot(device const block_tbq4_0 * xb, short il, thread type4x4 & reg) {
+    const float norm = float(xb->d);
+
+    float4x4 reg_f;
+    for (int j = 0; j < 16; j++) {
+        const uint8_t idx = (j & 1) ? (xb->qs[il * 8 + j / 2] >> 4) : (xb->qs[il * 8 + j / 2] & 0xF);
+        reg_f[j / 4][j % 4] = turboq_fwht_centroids_4bit[idx] * norm;
+    }
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_tbq3_0_rot(device const block_tbq3_0 * xb, short il, thread type4x4 & reg) {
+    const float norm = float(xb->d);
+
+    float4x4 reg_f;
+    for (int j = 0; j < 16; j++) {
+        const int v = il * 16 + j;
+        const int block = v / 8;
+        const int bit = (v % 8) * 3;
+        uint8_t idx;
+        if (bit < 6) {
+            idx = (xb->qs[block * 3 + 0] >> bit) & 0x7;
+        } else if (bit < 14) {
+            idx = ((xb->qs[block * 3 + 0] | (xb->qs[block * 3 + 1] << 8)) >> bit) & 0x7;
+        } else {
+            idx = ((xb->qs[block * 3 + 1] | (xb->qs[block * 3 + 2] << 8)) >> (bit - 8)) & 0x7;
+        }
+        reg_f[j / 4][j % 4] = turboq_fwht_centroids_3bit[idx] * norm;
+    }
+    reg = (type4x4) reg_f;
+}
+
 template [[host_name("kernel_cpy_f32_tbq4_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<128, block_tbq4_0, quantize_tbq4_0_block>;
 template [[host_name("kernel_cpy_f32_tbq3_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<128, block_tbq3_0, quantize_tbq3_0_block>;
 
@@ -7624,6 +7662,11 @@ template [[host_name("kernel_cpy_tbq4_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f3
 template [[host_name("kernel_cpy_tbq4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tbq4_0, 8, dequantize_tbq4_0>;
 template [[host_name("kernel_cpy_tbq3_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq3_0, 8, dequantize_tbq3_0>;
 template [[host_name("kernel_cpy_tbq3_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tbq3_0, 8, dequantize_tbq3_0>;
+
+template [[host_name("kernel_cpy_tbq4_0_f32_rot")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq4_0, 8, dequantize_tbq4_0_rot>;
+template [[host_name("kernel_cpy_tbq4_0_f16_rot")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tbq4_0, 8, dequantize_tbq4_0_rot>;
+template [[host_name("kernel_cpy_tbq3_0_f32_rot")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq3_0, 8, dequantize_tbq3_0_rot>;
+template [[host_name("kernel_cpy_tbq3_0_f16_rot")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tbq3_0, 8, dequantize_tbq3_0_rot>;
 
 template<typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
 kernel void kernel_set_rows_tbq(
