@@ -83,7 +83,7 @@ void quantize_row_iso4_0_ref(const float * GGML_RESTRICT x, block_iso4_0 * GGML_
 
         float rn = sqrtf(recon_sq);
         blk->d = GGML_FP32_TO_FP16((rn > 1e-10f) ? grp_norm / rn : grp_norm);
-        
+
     }
 }
 

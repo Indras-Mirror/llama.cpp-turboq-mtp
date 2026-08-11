@@ -77,7 +77,7 @@ void quantize_row_planar4_0_ref(const float * GGML_RESTRICT x, block_planar4_0 *
         float rn = sqrtf(recon_sq);
         float corrected = (rn > 1e-10f) ? grp_norm / rn : grp_norm;
         blk->d = GGML_FP32_TO_FP16(corrected);
-        
+
     }
 }
 
