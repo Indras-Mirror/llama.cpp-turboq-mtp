@@ -1987,6 +1987,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (!use_fused) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+            if (tbq_on_metal) {
+                // rotated-domain dequant (centroids only, no inverse WHT);
+                // the Metal cpy handler picks the *_rot kernels via op_params
+                k->op_params[0] = 1;
+            }
             cb(k, "k_rq_f32", il);
         }
 
@@ -2008,6 +2013,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (!use_fused) {
             const ggml_type cast_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
             v = ggml_cast(ctx0, v, cast_type);
+            if (tbq_on_metal) {
+                v->op_params[0] = 1;
+            }
             cb(v, use_flash_attn ? "v_rq_f16" : "v_rq_f32", il);
         }
 
@@ -2275,9 +2283,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const bool tbq_on_metal = inp->tbq_cache && sched_has_metal(sched);
 
-    if (inp->self_k_rot && !tbq_on_metal) {
+    if (inp->self_k_rot) {
+        // TBQ-on-Metal: Q is rotated by the codec's signed R to match the
+        // rotated-domain K dequant; the codec applies its own rotation to the
+        // freshly computed k_cur/v_cur on write, so they must NOT be rotated here.
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
-        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+        if (!tbq_on_metal) {
+            k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+        }
     }
 
     if (inp->self_v_rot && !tbq_on_metal) {
@@ -2311,7 +2324,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot && !tbq_on_metal) {
+    if (inp->self_v_rot) {
+        // post-rotation of the V attention output; on TBQ-on-Metal the matrix
+        // content is R^T (signed), otherwise the plain Hadamard
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
 
@@ -2442,9 +2457,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const bool tbq_on_metal = inp->tbq_cache && sched_has_metal(sched);
 
-    if (k_rot && !tbq_on_metal) {
+    if (k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
-        if (k_cur) {
+        if (k_cur && !tbq_on_metal) {
             k_cur = ggml_mul_mat_aux(ctx0, k_cur, k_rot);
         }
     }
