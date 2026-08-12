@@ -94,8 +94,11 @@ jobs:
           cuda_version: '12.4'
 
       - name: Install Ninja
+        shell: pwsh
         run: |
-          choco install ninja
+          curl.exe -L -o ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip
+          tar -xf ninja.zip -C .
+          echo "$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Build
         shell: cmd
