@@ -2415,8 +2415,9 @@ private:
     };
     std::vector<write_info> winfos;
 
-    // used by the CUDA async path (destroy); unused on other backends
-    [[maybe_unused]] ggml_backend_sched_t sched;
+#ifdef GGML_USE_CUDA
+    ggml_backend_sched_t sched; // used by the CUDA async path (destroy)
+#endif
 };
 
 class llama_io_read_host : public llama_io_read_i {
