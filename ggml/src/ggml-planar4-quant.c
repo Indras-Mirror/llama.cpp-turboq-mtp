@@ -40,7 +40,7 @@ static int nearest_4bit(float val) {
     return best;
 }
 
-static void quantize_row_planar4_0_ref(const float * GGML_RESTRICT x, block_planar4_0 * GGML_RESTRICT y, int64_t k) {
+void quantize_row_planar4_0_ref(const float * GGML_RESTRICT x, block_planar4_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % 128 == 0);
     planar4_init();
     const int nb = k / 128;
@@ -81,7 +81,7 @@ static void quantize_row_planar4_0_ref(const float * GGML_RESTRICT x, block_plan
     }
 }
 
-static void dequantize_row_planar4_0(const block_planar4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+void dequantize_row_planar4_0(const block_planar4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % 128 == 0);
     planar4_init();
     const int nb = k / 128;
@@ -102,7 +102,7 @@ static void dequantize_row_planar4_0(const block_planar4_0 * GGML_RESTRICT x, fl
     }
 }
 
-static size_t quantize_planar4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+size_t quantize_planar4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                           int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
     assert(n_per_row % 128 == 0);

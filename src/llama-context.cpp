@@ -2371,7 +2371,13 @@ private:
 class llama_io_write_host_async : public llama_io_write_i {
 public:
     llama_io_write_host_async(
-            uint8_t * p, size_t len, ggml_backend_sched_t sched) : ptr(p), buf_size(len), sched(sched) {}
+            uint8_t * p, size_t len, ggml_backend_sched_t sched) : ptr(p), buf_size(len)
+#ifdef GGML_USE_CUDA
+            , sched(sched)
+#endif
+    {
+        GGML_UNUSED(sched);
+    }
 
     ~llama_io_write_host_async() {
 #ifdef GGML_USE_CUDA
@@ -2418,6 +2424,10 @@ private:
     size_t buf_size = 0;
     size_t size_written = 0;
 
+#ifdef GGML_USE_CUDA
+    ggml_backend_sched_t sched;
+#endif
+
     struct write_info {
         ggml_tensor * tensor;
         uint8_t * ptr;
@@ -2425,9 +2435,6 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
-
-    // used by the CUDA async path (destroy); unused on other backends
-    [[maybe_unused]] ggml_backend_sched_t sched;
 };
 
 class llama_io_read_host : public llama_io_read_i {

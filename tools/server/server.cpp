@@ -201,6 +201,8 @@ int main(int argc, char ** argv) {
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
+    // In-process model swap
+    ctx_http.post("/models/load",              ex_wrapper(routes.post_models_load));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
@@ -285,6 +287,11 @@ int main(int argc, char ** argv) {
                 server_models::notify_router_sleeping_state(sleeping);
             });
         }
+
+        // refresh routes metadata after an in-process model swap
+        ctx_server.on_model_swapped([&]() {
+            routes.update_meta(ctx_server);
+        });
 
         if (!ctx_server.load_model(params)) {
             clean_up();

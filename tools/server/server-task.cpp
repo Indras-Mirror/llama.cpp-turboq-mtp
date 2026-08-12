@@ -1936,6 +1936,20 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
+// server_task_result_model_swap
+//
+json server_task_result_model_swap::to_json() {
+    return json {
+        { "id",     id },
+        { "name",   name },
+        { "model",  model },
+        { "path",   path },
+        { "status", error.empty() ? "loaded" : "error" },
+        { "error",  error },
+    };
+}
+
+//
 // server_task_result_get_lora
 //
 

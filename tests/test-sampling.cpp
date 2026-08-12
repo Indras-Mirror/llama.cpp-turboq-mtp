@@ -304,7 +304,7 @@ static void test_dist_all_neg_inf() {
 
     // After applying dist, selected should be a valid token (0 <= id < n_vocab)
     // Before the fix, the assert(found) at llama-sampler.cpp:1094 would fire here.
-    printf("dist all -inf selected = %d (n_vocab = %d)\n", cur_p.selected, n_vocab);
+    printf("dist all -inf selected = %d (n_vocab = %d)\n", (int) cur_p.selected, n_vocab);
     GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < n_vocab);
 
     llama_sampler_free(sampler);

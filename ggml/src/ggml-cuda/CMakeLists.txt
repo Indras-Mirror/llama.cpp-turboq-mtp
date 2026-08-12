@@ -250,6 +250,9 @@ if (CUDAToolkit_FOUND)
 
     if (NOT MSVC)
         list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+        # -Wmissing-noreturn is bogus for __device__ functions (nvcc host pass
+        # sees truncated bodies and flags them as noreturn candidates)
+        list(APPEND CUDA_CXX_FLAGS -Wno-missing-noreturn)
     else()
         # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
         # https://github.com/NVIDIA/cccl/pull/6827

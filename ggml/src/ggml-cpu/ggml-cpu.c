@@ -1724,11 +1724,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dup(params, tensor);
             } break;
-        case GGML_OP_GATED_DELTA_NET_PIPE:
-            {
-                // CUDA-only fused kernel (see ggml-cuda); not supported on CPU
-                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is not supported on CPU");
-            }
         case GGML_OP_ADD:
             {
                 ggml_compute_forward_add(params, tensor);
@@ -2060,6 +2055,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_PIPE:
+            {
+                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is CUDA-only (fused DeltaNet chunk pipeline); GDN models require GPU layers (e.g. -ngl 99)\n");
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2240,6 +2239,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_PIPE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2960,15 +2960,18 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t per_thread = S_v + (keep_intermediates ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
-        case GGML_OP_GATED_DELTA_NET_PIPE:
-            {
-                // CUDA-only fused kernel (see ggml-cuda); not supported on CPU
-                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is not supported on CPU");
-            }
-        case GGML_OP_COUNT:
-            {
-                GGML_ABORT("fatal error");
-            }
+                case GGML_OP_GATED_DELTA_NET_PIPE:
+                    {
+                        // CUDA-only op; CPU graph execution aborts at compute time.
+                        // Size for the plain recurrent-state workspace regardless.
+                        const int64_t S_v = node->src[0]->ne[0];
+                        const int64_t per_thread = S_v;
+                        cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_COUNT:
+                    {
+                        GGML_ABORT("fatal error");
+                    }
                 default:
                     break;
             }

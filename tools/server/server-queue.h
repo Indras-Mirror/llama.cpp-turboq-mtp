@@ -47,6 +47,14 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // ids of all tasks currently pending in the main and deferred queues
+    // (used by the model swap handler to reject them with an error)
+    std::vector<int> get_pending_task_ids();
+
+    // drop all tasks from the main and deferred queues (without notifying their
+    // readers; the caller must send an error result for each id first)
+    void clear_all_tasks();
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();

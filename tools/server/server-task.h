@@ -26,6 +26,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_MODEL_SWAP,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -167,6 +168,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_MODEL_SWAP
+    std::string model_name;
 
     server_task() = default;
 
@@ -546,6 +550,19 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_model_swap : server_task_result {
+    std::string name;     // the requested model name (preset key)
+    std::string model;    // the resolved model_name (alias) of the newly loaded model
+    std::string path;     // the model file path
+    std::string error;    // empty on success
+
+    virtual bool is_error() override {
+        return !error.empty();
+    }
 
     virtual json to_json() override;
 };

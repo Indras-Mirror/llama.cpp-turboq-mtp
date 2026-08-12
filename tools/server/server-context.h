@@ -81,6 +81,10 @@ struct server_context {
     // register a callback to be called when sleeping state changes
     // must be set before load_model() is called
     void on_sleeping_changed(std::function<void(bool)> callback);
+
+    // register a callback to be called after a model swap completes
+    // invoked on the main loop thread; used to refresh server_routes::meta
+    void on_model_swapped(std::function<void()> callback);
 };
 
 
@@ -92,9 +96,15 @@ struct server_routes {
 
     void init_routes();
 
-    // note: this is not thread-safe and can only when ctx_http.is_ready is false
+    // refresh the cached server metadata (e.g. after a model swap).
+    // safe to call from the main loop thread while HTTP worker threads read meta
     void update_meta(const server_context & ctx_server) {
-        this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
+        std::atomic_store(&this->meta, std::make_shared<const server_context_meta>(ctx_server.get_meta()));
+    }
+
+    // snapshot of server metadata; safe to call from HTTP worker threads
+    std::shared_ptr<const server_context_meta> get_meta() const {
+        return std::atomic_load(&this->meta);
     }
 
     // handlers using lambda function, so that they can capture `this` without `std::bind`
@@ -122,6 +132,7 @@ struct server_routes {
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_models_load;
 
     // to be used in router mode
     json get_model_info() const;
@@ -138,8 +149,14 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
 
-    // using unique_ptr to allow late initialization of const
-    std::unique_ptr<const server_context_meta> meta;
+    // if `name` is a registered preset that is not currently loaded, swap to it
+    // synchronously (blocking until the swap task completes)
+    // returns a non-empty error json if the swap failed, empty json on success/no-op
+    json swap_model_if_requested(const server_http_req & req, server_response_reader & rd, const std::string & name);
+
+    // using shared_ptr to allow atomic load/store while a model swap refreshes
+    // the metadata concurrently with HTTP worker threads
+    std::shared_ptr<const server_context_meta> meta;
 
     const common_params & params;
     const server_context_impl & ctx_server;
