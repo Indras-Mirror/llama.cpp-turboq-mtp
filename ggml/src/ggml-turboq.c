@@ -551,14 +551,16 @@ void quantize_row_tbq3_0_ref(const float * GGML_RESTRICT x, block_tbq3_0 * GGML_
             indices[j] = idx;
         }
 
-        // Pack 8 × 3-bit values into 3 bytes
+        // Pack 8 × 3-bit values into 3 bytes (little-endian 24-bit lane:
+        // value j occupies bits [bit, bit+3) of the 24-bit group)
         memset(y[b].qs, 0, QK_TBQ3 * 3 / 8);
         for (int j = 0; j < QK_TBQ3; j++) {
-            // Repack: 8 values per 3 bytes, little-endian bit packing
             int block = j / 8;
             int bit = (j % 8) * 3;
-            y[b].qs[block * 3 + 0] |= (indices[j] & 0x7) << (bit < 8 ? bit : 0);
-            if (bit >= 8) y[b].qs[block * 3 + 1] |= ((indices[j] >> (8 - bit)) & 0x7);
+            uint32_t val = ((uint32_t) indices[j] & 0x7) << bit;
+            y[b].qs[block * 3 + 0] |= val & 0xFF;
+            y[b].qs[block * 3 + 1] |= (val >> 8) & 0xFF;
+            y[b].qs[block * 3 + 2] |= (val >> 16) & 0xFF;
         }
 
         // Norm correction: corrected = original / reconstruction norm

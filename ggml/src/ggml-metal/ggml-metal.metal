@@ -7429,6 +7429,239 @@ template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
 
+// ===========================================================================
+// TBQ3_0 / TBQ4_0 (TurboQuant) KV cache kernels
+// Port of ggml-turboq.c (CPU reference codec). Values are stored in the
+// WHT-rotated domain: quantize applies (s1 -> WHT128 -> s2), dequantize the
+// inverse (s2 -> WHT128 -> s1, WHT is self-inverse).
+// ===========================================================================
+
+constant float turboq_wht_signs1[128] = {
+    -1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,
+    -1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f,
+    -1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,
+    -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f};
+constant float turboq_wht_signs2[128] = {
+     1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f,
+     1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,
+     1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f,
+     1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f};
+
+constant float turboq_fwht_centroids_4bit[16] = {
+    -0.241556f, -0.182907f, -0.143047f, -0.111065f,
+    -0.083317f, -0.058069f, -0.034311f, -0.011353f,
+     0.011353f,  0.034311f,  0.058069f,  0.083317f,
+     0.111065f,  0.143047f,  0.182907f,  0.241556f,
+};
+constant float turboq_fwht_midpoints_4bit[15] = {
+    -0.212232f, -0.162977f, -0.127056f, -0.097191f, -0.070693f,
+    -0.046190f, -0.022832f,  0.000000f,  0.022832f,  0.046190f,
+     0.070693f,  0.097191f,  0.127056f,  0.162977f,  0.212232f,
+};
+constant float turboq_fwht_centroids_3bit[8] = {
+    -1.646828f, -0.895384f, -0.491349f, -0.157976f,
+     0.157976f,  0.491349f,  0.895384f,  1.646828f,
+};
+constant float turboq_fwht_midpoints_3bit[7] = {
+    -1.271106f, -0.693367f, -0.324663f, 0.0f,
+     0.324663f,  0.693367f,  1.271106f,
+};
+
+void tbq_fwht_128(thread float * x) {
+    for (int h = 1; h < 128; h *= 2) {
+        for (int i = 0; i < 128; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j];
+                const float b = x[j + h];
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128;
+}
+
+uint8_t tbq_find_nearest(float val, constant float * boundaries, int n_boundaries) {
+    int lo = 0;
+    int hi = n_boundaries;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (val < boundaries[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return (uint8_t) lo;
+}
+
+void quantize_tbq4_0_block(device const float * src, device block_tbq4_0 & dst) {
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; ++j) norm_sq += src[j] * src[j];
+    const float norm = sqrt(norm_sq);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    thread float rot[128];
+    for (int j = 0; j < 128; j++) rot[j] = src[j] * inv_norm * turboq_wht_signs1[j];
+    tbq_fwht_128(rot);
+    for (int j = 0; j < 128; j++) rot[j] *= turboq_wht_signs2[j];
+
+    for (int j = 0; j < 128; j += 2) {
+        const uint8_t idx0 = tbq_find_nearest(rot[j],     turboq_fwht_midpoints_4bit, 15);
+        const uint8_t idx1 = tbq_find_nearest(rot[j + 1], turboq_fwht_midpoints_4bit, 15);
+        dst.qs[j / 2] = (idx1 << 4) | idx0;
+    }
+
+    float recon_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        const uint8_t idx = (j & 1) ? (dst.qs[j / 2] >> 4) : (dst.qs[j / 2] & 0xF);
+        const float r = turboq_fwht_centroids_4bit[idx];
+        recon_sq += r * r;
+    }
+    const float recon_norm = sqrt(recon_sq);
+    const float corrected = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    dst.d = half(corrected);
+}
+
+template <typename type4x4>
+void dequantize_tbq4_0(device const block_tbq4_0 * xb, short il, thread type4x4 & reg) {
+    const float norm = float(xb->d);
+
+    thread float rot[128];
+    for (int j = 0; j < 128; j++) {
+        const uint8_t idx = (j & 1) ? (xb->qs[j / 2] >> 4) : (xb->qs[j / 2] & 0xF);
+        rot[j] = turboq_fwht_centroids_4bit[idx];
+    }
+    for (int j = 0; j < 128; j++) rot[j] *= turboq_wht_signs2[j];
+    tbq_fwht_128(rot);
+    for (int j = 0; j < 128; j++) rot[j] *= turboq_wht_signs1[j];
+
+    float4x4 reg_f;
+    for (int j = 0; j < 16; j++) {
+        reg_f[j / 4][j % 4] = rot[il * 16 + j] * norm;
+    }
+    reg = (type4x4) reg_f;
+}
+
+void quantize_tbq3_0_block(device const float * src, device block_tbq3_0 & dst) {
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; ++j) norm_sq += src[j] * src[j];
+    const float norm = sqrt(norm_sq);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+
+    thread float rot[128];
+    for (int j = 0; j < 128; j++) rot[j] = src[j] * inv_norm * turboq_wht_signs1[j];
+    tbq_fwht_128(rot);
+    for (int j = 0; j < 128; j++) rot[j] *= turboq_wht_signs2[j];
+
+    for (int j = 0; j < 48; j++) dst.qs[j] = 0;
+
+    for (int j = 0; j < 128; j++) {
+        const uint8_t idx = tbq_find_nearest(rot[j], turboq_fwht_midpoints_3bit, 7);
+        const int block = j / 8;
+        const int bit = (j % 8) * 3;
+        // little-endian 24-bit lane: value j occupies bits [bit, bit+3)
+        const uint32_t val24 = ((uint32_t) idx & 0x7) << bit;
+        dst.qs[block * 3 + 0] |= val24 & 0xFF;
+        dst.qs[block * 3 + 1] |= (val24 >> 8) & 0xFF;
+        dst.qs[block * 3 + 2] |= (val24 >> 16) & 0xFF;
+    }
+
+    float recon_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        const int block = j / 8;
+        const int bit = (j % 8) * 3;
+        uint8_t idx;
+        if (bit < 6) {
+            idx = (dst.qs[block * 3 + 0] >> bit) & 0x7;
+        } else if (bit < 14) {
+            idx = ((dst.qs[block * 3 + 0] | (dst.qs[block * 3 + 1] << 8)) >> bit) & 0x7;
+        } else {
+            idx = ((dst.qs[block * 3 + 1] | (dst.qs[block * 3 + 2] << 8)) >> (bit - 8)) & 0x7;
+        }
+        const float r = turboq_fwht_centroids_3bit[idx];
+        recon_sq += r * r;
+    }
+    const float recon_norm = sqrt(recon_sq);
+    const float corrected = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+    dst.d = half(corrected);
+}
+
+template <typename type4x4>
+void dequantize_tbq3_0(device const block_tbq3_0 * xb, short il, thread type4x4 & reg) {
+    const float norm = float(xb->d);
+
+    thread float rot[128];
+    for (int j = 0; j < 128; j++) {
+        const int block = j / 8;
+        const int bit = (j % 8) * 3;
+        uint8_t idx;
+        if (bit < 6) {
+            idx = (xb->qs[block * 3 + 0] >> bit) & 0x7;
+        } else if (bit < 14) {
+            idx = ((xb->qs[block * 3 + 0] | (xb->qs[block * 3 + 1] << 8)) >> bit) & 0x7;
+        } else {
+            idx = ((xb->qs[block * 3 + 1] | (xb->qs[block * 3 + 2] << 8)) >> (bit - 8)) & 0x7;
+        }
+        rot[j] = turboq_fwht_centroids_3bit[idx];
+    }
+    for (int j = 0; j < 128; j++) rot[j] *= turboq_wht_signs2[j];
+    tbq_fwht_128(rot);
+    for (int j = 0; j < 128; j++) rot[j] *= turboq_wht_signs1[j];
+
+    float4x4 reg_f;
+    for (int j = 0; j < 16; j++) {
+        reg_f[j / 4][j % 4] = rot[il * 16 + j] * norm;
+    }
+    reg = (type4x4) reg_f;
+}
+
+template [[host_name("kernel_cpy_f32_tbq4_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<128, block_tbq4_0, quantize_tbq4_0_block>;
+template [[host_name("kernel_cpy_f32_tbq3_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<128, block_tbq3_0, quantize_tbq3_0_block>;
+
+template [[host_name("kernel_cpy_tbq4_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq4_0, 8, dequantize_tbq4_0>;
+template [[host_name("kernel_cpy_tbq4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tbq4_0, 8, dequantize_tbq4_0>;
+template [[host_name("kernel_cpy_tbq3_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tbq3_0, 8, dequantize_tbq3_0>;
+template [[host_name("kernel_cpy_tbq3_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tbq3_0, 8, dequantize_tbq3_0>;
+
+template<typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
+kernel void kernel_set_rows_tbq(
+        constant ggml_metal_kargs_set_rows & args,
+        device const void * src0,
+        device const void * src1,
+        device float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiitg[[thread_index_in_threadgroup]],
+        uint3 tptg [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+
+    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    const int32_t i10 = i01;
+    const TI i1 = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+    device block_q * dst_row = (device block_q *) ((device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float * src_row = (const device float *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
+        quantize_func(src_row + 128*ind, dst_row[ind]);
+    }
+}
+
+typedef decltype(kernel_set_rows_tbq<int64_t, block_tbq4_0, quantize_tbq4_0_block>) set_rows_tbq4_0_i64_t;
+template [[host_name("kernel_set_rows_tbq4_0_i64")]] kernel set_rows_tbq4_0_i64_t kernel_set_rows_tbq<int64_t, block_tbq4_0, quantize_tbq4_0_block>;
+template [[host_name("kernel_set_rows_tbq4_0_i32")]] kernel set_rows_tbq4_0_i64_t kernel_set_rows_tbq<int32_t, block_tbq4_0, quantize_tbq4_0_block>;
+template [[host_name("kernel_set_rows_tbq3_0_i64")]] kernel set_rows_tbq4_0_i64_t kernel_set_rows_tbq<int64_t, block_tbq3_0, quantize_tbq3_0_block>;
+template [[host_name("kernel_set_rows_tbq3_0_i32")]] kernel set_rows_tbq4_0_i64_t kernel_set_rows_tbq<int32_t, block_tbq3_0, quantize_tbq3_0_block>;
+
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
     device  const char * src0,
