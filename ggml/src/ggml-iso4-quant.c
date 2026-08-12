@@ -46,7 +46,7 @@ static int nearest_16(float val) {
     return best;
 }
 
-void quantize_row_iso4_0_ref(const float * GGML_RESTRICT x, block_iso4_0 * GGML_RESTRICT y, int64_t k) {
+static void quantize_row_iso4_0_ref(const float * GGML_RESTRICT x, block_iso4_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % 128 == 0);
     iso4_init();
     const int nb = k / 128;
@@ -87,7 +87,7 @@ void quantize_row_iso4_0_ref(const float * GGML_RESTRICT x, block_iso4_0 * GGML_
     }
 }
 
-void dequantize_row_iso4_0(const block_iso4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+static void dequantize_row_iso4_0(const block_iso4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % 128 == 0);
     iso4_init();
     const int nb = k / 128;
@@ -116,7 +116,7 @@ void dequantize_row_iso4_0(const block_iso4_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
-size_t quantize_iso4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+static size_t quantize_iso4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                        int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
     assert(n_per_row % 128 == 0);

@@ -2358,6 +2358,7 @@ public:
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, winfo.tensor);
             ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+        (void) sched;
 #else
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
@@ -2396,8 +2397,6 @@ private:
     size_t buf_size = 0;
     size_t size_written = 0;
 
-    ggml_backend_sched_t sched;
-
     struct write_info {
         ggml_tensor * tensor;
         uint8_t * ptr;
@@ -2405,6 +2404,9 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    // used by the CUDA async path (destroy); unused on other backends
+    [[maybe_unused]] ggml_backend_sched_t sched;
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3441,6 +3443,20 @@ llama_context * llama_init_from_model(
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
         return nullptr;
+    }
+
+    // Quality guard for 3-bit TBQ KV (measured 2026-08-11, Qwen3.5-4B, CPU path):
+    // q4_0 K + tbq3_0 V collapses into token repetition from the first token, while
+    // q4_0 K + tbq4_0 V is clean. 4-bit is the supported TBQ path; 3-bit is kept for
+    // experiments (CUDA) behind an explicit env override.
+    if (!getenv("LLAMA_ALLOW_TBQ3_KV")) {
+        if (params.type_v == GGML_TYPE_TBQ3_0) {
+            LLAMA_LOG_ERROR("%s: tbq3_0 V cache is not quality-safe (token repetition on Qwen3.5-4B); use tbq4_0 or q4_0, or set LLAMA_ALLOW_TBQ3_KV=1 to force\n", __func__);
+            return nullptr;
+        }
+        if (params.type_k == GGML_TYPE_TBQ3_0) {
+            LLAMA_LOG_WARN("%s: tbq3_0 K cache is experimental and untested in isolation; set LLAMA_ALLOW_TBQ3_KV=1 to silence\n", __func__);
+        }
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
