@@ -192,9 +192,7 @@ static __global__ void k_tbq3_dequant_full(
 
     __shared__ float shared[QK_TBQ3];
 
-    // Read fp16 norm from end of block
-    const ggml_half * d = (const ggml_half *)(qs + block_idx * QK_TBQ3 / 2); // wrong offset
-    // Actually: block size = QK_TBQ3 * 3 / 8 = 48 bytes + 2 bytes norm = 50 bytes
+    // block layout: 48 bytes packed 3-bit indices + 2 bytes fp16 norm
     const uint8_t * block_qs = qs + block_idx * (QK_TBQ3 * 3 / 8 + sizeof(ggml_half));
     const ggml_half * block_d = (const ggml_half *)(block_qs + QK_TBQ3 * 3 / 8);
     const float norm_corrected = __half2float(*block_d);
