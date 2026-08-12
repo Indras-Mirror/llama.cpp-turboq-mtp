@@ -54,6 +54,10 @@ __device__ void quantize_f32_planar3_block(const float * x, block_planar3_0 * ds
 __device__ void quantize_f32_iso3_block(const float * x, block_iso3_0 * dst);
 __device__ void quantize_f32_planar4_block(const float * x, block_planar4_0 * dst);
 __device__ void quantize_f32_iso4_block(const float * x, block_iso4_0 * dst);
+__device__ void quantize_f32_planar3_block_norot(const float * x, block_planar3_0 * dst);
+__device__ void quantize_f32_iso3_block_norot(const float * x, block_iso3_0 * dst);
+__device__ void quantize_f32_planar4_block_norot(const float * x, block_planar4_0 * dst);
+__device__ void quantize_f32_iso4_block_norot(const float * x, block_iso4_0 * dst);
 
 __device__ void quantize_f32_planar3_block(const float * x, block_planar3_0 * dst) {
     // Norm
