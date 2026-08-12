@@ -4,28 +4,18 @@ on:
   push:
     branches:
       - master
-    paths:
-      - '.github/workflows/ci.yml'
-      - '**/CMakeLists.txt'
-      - '**/*.h'
-      - '**/*.hpp'
-      - '**/*.c'
-      - '**/*.cpp'
-      - '**/*.cu'
   pull_request:
     branches:
       - master
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
-    runs-on: ${{ matrix.os }}
+  # CPU build + server tests + binary artifacts (Linux x64)
+  build-ubuntu:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,6 +45,96 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: llama-server-${{ matrix.os }}-x64
+          name: llama-server-ubuntu-x64
+          path: build/bin/
+          retention-days: 7
+
+  # NVIDIA consumer target: RTX 4090 (sm_89) Linux CUDA build
+  build-cuda:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt update
+          apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
+
+      - name: Build with CMake
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=89-real \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON
+          cmake --build build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-linux-cuda-x64
+          path: build/bin/
+          retention-days: 7
+
+  # NVIDIA consumer target: Windows CUDA build (sm_89)
+  build-windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_CUDA_ARCHITECTURES=89-real ^
+            -DGGML_CUDA=ON
+          cmake --build build --config Release
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-windows-cuda-x64
+          path: build/bin/Release/
+          retention-days: 7
+
+  # Apple Silicon Metal build
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_METAL=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --config Release -j 4
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-macos-arm64
           path: build/bin/
           retention-days: 7

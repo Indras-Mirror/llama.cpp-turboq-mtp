@@ -1724,6 +1724,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dup(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_PIPE:
+            {
+                // CUDA-only fused kernel (see ggml-cuda); not supported on CPU
+                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is not supported on CPU");
+            }
         case GGML_OP_ADD:
             {
                 ggml_compute_forward_add(params, tensor);
@@ -2955,10 +2960,15 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t per_thread = S_v + (keep_intermediates ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
-                case GGML_OP_COUNT:
-                    {
-                        GGML_ABORT("fatal error");
-                    }
+        case GGML_OP_GATED_DELTA_NET_PIPE:
+            {
+                // CUDA-only fused kernel (see ggml-cuda); not supported on CPU
+                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is not supported on CPU");
+            }
+        case GGML_OP_COUNT:
+            {
+                GGML_ABORT("fatal error");
+            }
                 default:
                     break;
             }
