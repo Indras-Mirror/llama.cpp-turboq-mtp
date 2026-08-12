@@ -36,7 +36,7 @@
                 {%- set reasoning_content = message.content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
             {%- endif %}
         {%- endif %}
-        {%- if loop.index0 > ns.last_query_index %}
+        {%- if loop.index0 > ns.last_query_index or reasoning_content %}
             {%- if loop.last or (not loop.last and reasoning_content) %}
                 {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
             {%- else %}
