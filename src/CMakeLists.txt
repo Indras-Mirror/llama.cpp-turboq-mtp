@@ -51,7 +51,11 @@ target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 if (GGML_CUDA)
     # llama-context.cpp includes <cuda_runtime.h> for the async checkpoint path
-    target_include_directories(llama PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    set(_cuda_includes ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    if (DEFINED ENV{CUDA_PATH})
+        list(APPEND _cuda_includes "$ENV{CUDA_PATH}/include")
+    endif()
+    target_include_directories(llama PRIVATE ${_cuda_includes})
 endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
