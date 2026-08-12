@@ -2364,6 +2364,7 @@ public:
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, winfo.tensor);
             ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+        (void) sched;
 #else
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
@@ -2413,6 +2414,9 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    // used by the CUDA async path (destroy); unused on other backends
+    [[maybe_unused]] ggml_backend_sched_t sched;
 };
 
 class llama_io_read_host : public llama_io_read_i {

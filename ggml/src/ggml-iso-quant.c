@@ -166,7 +166,7 @@ void dequantize_row_iso3_0(const block_iso3_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
-size_t quantize_iso3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+static size_t quantize_iso3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                        int64_t nrows, int64_t n_per_row, const float * imatrix) {
     (void)imatrix;
     assert(n_per_row % QK_ISO3 == 0);

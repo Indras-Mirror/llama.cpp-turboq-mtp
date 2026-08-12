@@ -1724,6 +1724,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dup(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_PIPE:
+            {
+                // CUDA-only fused kernel (see ggml-cuda); not supported on CPU
+                GGML_ABORT("GGML_OP_GATED_DELTA_NET_PIPE is not supported on CPU");
+            }
         case GGML_OP_ADD:
             {
                 ggml_compute_forward_add(params, tensor);
