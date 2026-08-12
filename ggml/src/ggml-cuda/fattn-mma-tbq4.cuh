@@ -30,8 +30,6 @@ static __device__ __forceinline__ void flash_attn_ext_tbq4_load_tile(
     // elem_idx = tid % elems_per_row, row = tid / elems_per_row
     // With 128 threads and 128 elems/row for D=256: thread N handles elem N, row 0 only.
     // For D=128 (64 elems/row): threads 0-63 handle elem 0-63, threads 64-127 handle elem 0-63 row 1.
-    constexpr int elems_per_pass = nthreads <= elems_per_row ? nthreads : nthreads / 2;
-
     for (int base_row = 0; base_row < nbatch_fa; base_row += (nthreads + elems_per_row - 1) / elems_per_row) {
         const int idx = tid;
         const int elem_idx = idx % elems_per_row;
