@@ -125,6 +125,17 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+if (GGML_CUDA)
+    # common.cpp includes <cuda_runtime.h> for the async checkpoint staging
+    set(_cuda_includes ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    if (DEFINED ENV{CUDA_PATH})
+        list(APPEND _cuda_includes "$ENV{CUDA_PATH}/include")
+    endif()
+    if (EXISTS "/usr/local/cuda/include")
+        list(APPEND _cuda_includes "/usr/local/cuda/include")
+    endif()
+    target_include_directories(${TARGET} PRIVATE ${_cuda_includes})
+endif()
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)
