@@ -109,8 +109,7 @@ gated_delta_net_pipeline_cuda(
         //   first CS entries along dim 0: kg_t[j][i]
         //   last entry if GDA (g_extra=1): g_last (scalar)
         //   last S_v entries if KDA (g_extra=S_v): g_last[i] (vector)
-        const int64_t kgt_off = v_head * head_v_s + ch * ch_s + lane * CS; // col * CS
-        // Wait, kg_t layout is different: ne[0]=CS+g_extra, ne[1]=S_v
+        // kg_t layout: ne[0]=CS+g_extra, ne[1]=S_v
         // kg_t[j][i][ch][vh] at offset: vh * (CS+g_extra)*S_v*n_chunks + ch * (CS+g_extra)*S_v + i * (CS+g_extra) + j
 
         const int64_t s_kgt_ch = (CS + (KDA ? S_v : 1)) * S_v;
