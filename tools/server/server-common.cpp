@@ -1167,6 +1167,15 @@ json oaicompat_chat_params_parse(
                 first_kept = i;
             }
 
+            // Never drop the last message (the active user query): if it alone
+            // exceeds the budget (e.g. a large single-message document whose
+            // estimate overshoots), keep it anyway and let the slot handle the
+            // length — otherwise the prompt silently loses its query and the
+            // template raises "No user query found in messages".
+            if (first_kept > (int)inputs.messages.size() - 1) {
+                first_kept = (int)inputs.messages.size() - 1;
+            }
+
             // Rebuild if we need to drop anything (messages between sys and first_kept)
             if (first_kept > (sys_idx >= 0 ? sys_idx + 1 : 0)) {
                 std::vector<common_chat_msg> trimmed;
