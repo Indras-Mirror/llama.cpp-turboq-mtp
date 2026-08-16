@@ -96,6 +96,40 @@ Context sizing: 4K → 11.61 t/s, 32K → 11.39 t/s, 256K → 10.29 t/s, 512K �
 
 ---
 
+## Qwen3.8 MTP with TBQ4 Draft KV (2026-08-16)
+
+Verified on **Qwen3.8-27B-heretic-ara.i1-IQ4_XS** (qwen35 arch, embedded MTP head, `nextn_predict_layers=1`) with llama-server on RTX 4090 24GB at `-c 262144`. This is the Qwen3.8-lineage companion to the Qwen3.6 MTP mode above, and the first config in this fork where the **draft cache gets its own quant type**, fully independent of the main KV cache.
+
+### Why the draft KV needs its own type
+
+At 262K the main TBQ4 KV + mmproj already use 19.9 GiB of the 24.5 GiB VRAM budget, leaving ~4.2 GiB of headroom. An fp16 draft KV (~4.35 GiB) does **not** fit. Quantizing the draft cache with TBQ4 (~1.1 GiB) closes the gap — **total 20,637 MiB, 3.9 GiB headroom, no OOM** — while still drafting 2-3 tokens per forward pass.
+
+### Flags
+
+The draft KV type is set separately from the main cache: `--spec-draft-type-k` / `--spec-draft-type-v` (aliases `-ctkd` / `-ctvd`, long forms `--cache-type-k-draft` / `--cache-type-v-draft`, see `common/arg.cpp:3926`/`3939`). It does not follow `-ctk` / `-ctv`:
+
+```bash
+./build-mtp/bin/llama-server \
+  -m qwen3.8-27b-heretic-ara.i1-IQ4_XS.gguf \
+  -c 262144 --flash-attn on -ngl 99 \
+  -ctk tbq4_0 -ctv tbq4_0 \
+  -ctkd tbq4_0 -ctvd tbq4_0 \
+  --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+### Measured results
+
+| Metric | Value |
+|--------|-------|
+| Draft acceptance | 0.52-0.67 |
+| Mean draft length | 2.55-3.0 (drafting active) |
+| Generation | **74.1 t/s** vs ~44-50 t/s without MTP (**~1.5-1.7x**) |
+| Prompt processing | 452 t/s |
+| VRAM total | 20,637 MiB (3.9 GiB headroom, no OOM) |
+| Native tool_use probe | clean (`stop_reason: tool_use`) |
+
+---
+
 ## Upstream MTP Status — Why We Keep Our Implementation
 
 As of May 16, 2026, upstream `ggml-org/llama.cpp` merged official MTP support via [PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673) (`255582687`), which uses `--spec-type draft-mtp`. **We are NOT adopting it.** Our custom MTP (`--spec-type mtp`) predates the merge and beats upstream in every measured metric — head-to-head on RTX 4090 24GB with Qwen3.6-27B-Heretic-v2-MTP Q4_K_M:
@@ -160,6 +194,8 @@ tile[...] = __halves2half2(lo, hi);
 | `--no-kv-offload` | Keep KV cache in system RAM (enables 512K/1M on 24GB VRAM) |
 | `--flash-attn on` | Required for the fused TBQ4 path |
 | `--spec-type mtp --spec-draft-n-max 3` | Enable MTP speculative decoding (Qwen3.6) |
+| `--spec-type draft-mtp` | Enable upstream-style MTP (Qwen3.8, embedded MTP head) |
+| `-ctkd tbq4_0 -ctvd tbq4_0` | Draft KV cache type (`--spec-draft-type-k/v`) — independent of main `-ctk`/`-ctv` |
 | `DSV4_CTK_COMP=tbq3_0` | Per-cache K quant: TBQ4 for raw-ratio sites, TBQ3 for compressed (mixed) |
 | `--mlock` | Prevent swap under memory pressure |
 | `-ub 32` | Small ubatch keeps the MTP compute buffer small |
