@@ -555,7 +555,7 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         // common_speculative_draft() clears it AFTER recording impl_last.
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted) override {
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
         const int32_t n_drafted_last = (int32_t) last_n_drafted;
         if (n_drafted_last > 0) {
@@ -595,6 +595,32 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             const llama_pos drop_from = pos_max - n_to_drop + 1;
             llama_memory_seq_rm(llama_get_memory(ctx_mtp), /*seq_id=*/ 0,
                                 /*p0=*/ drop_from, /*p1=*/ -1);
+        }
+
+        // The target context decoded the whole batch [sampled, d1..dn] in one
+        // shot, so the rejected draft rows are still cached in ctx_tgt. Leaving
+        // them in place makes the next batch start at or below the cached
+        // frontier: for M-RoPE models (VLM-arch qwen35, e.g. Qwen3.8-27B) the
+        // strict X < Y position check in llama-batch.cpp then fails the decode
+        // ("Invalid input batch"), and for 1D models it silently re-decodes
+        // over stale cells with a contaminated GDN recurrent state.
+        // Trim the rejected rows from the target: the hybrid memory rolls back
+        // the recurrent 'S' state (n_rs_seq is set to draft.n_max for MTP) and
+        // drops the attention cells, so the next batch starts from a clean
+        // frontier at exactly X < Y.
+        if (n_drafted_last > 0 && n_accepted < (uint16_t) n_drafted_last) {
+            const llama_pos pos_max_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id);
+            if (pos_max_tgt >= 0) {
+                const llama_pos trim_from = pos_max_tgt - n_drafted_last + (llama_pos) n_accepted + 1;
+                const bool ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, trim_from, -1);
+                if (!ok) {
+                    LOG_WRN("%s: target rollback FAILED: n_drafted=%d n_acc=%d pos_max_tgt=%d trim_from=%d "
+                            "(rollback %d > n_rs_seq?) — stale draft rows remain in ctx_tgt and the next "
+                            "batch may fail the M-RoPE X < Y check\n",
+                            __func__, (int) n_drafted_last, (int) n_accepted, (int) pos_max_tgt, (int) trim_from,
+                            (int) (pos_max_tgt - trim_from + 1));
+                }
+            }
         }
         last_n_drafted = 0;
         last_n_accepted = (int32_t) n_accepted;
@@ -1378,10 +1404,6 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (n_accepted == 0) {
-        return;
-    }
-
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (!impl) {
@@ -1398,6 +1420,12 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
+        // Note: accept() MUST also be called for n_accepted == 0 — the
+        // implementations rely on it to drop rejected draft rows from the
+        // KV caches (ctx_mtp, and the target for MTP). Skipping it on a
+        // full rejection leaves stale rows behind that violate the
+        // M-RoPE X < Y check on the next batch (and corrupt EAGLE3's
+        // pending-state rebase).
         impl->accept(seq_id, n_accepted);
         impl->n_call_accept++;
     }
