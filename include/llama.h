@@ -1009,6 +1009,15 @@ extern "C" {
             struct llama_context * ctx_target,
             struct llama_context * ctx_mtp);
 
+    // Invalidate the cross-ubatch MTP pending stash (pending_h / pending_pos)
+    // on the target context. Must be called after any direct manipulation of
+    // the target memory (e.g. llama_memory_seq_rm on rejected draft rows) that
+    // moves the target frontier backward, otherwise handle_mtp_for_ubatch()
+    // sees pending_pos + 1 != pos_start on the next batch and the MTP draft
+    // head is never re-seeded (permanent desync -> repetition loop).
+    LLAMA_API void llama_reset_mtp_pending(
+            struct llama_context * ctx);
+
     LLAMA_API bool llama_context_seq_rm(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,

@@ -619,6 +619,18 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                             "batch may fail the M-RoPE X < Y check\n",
                             __func__, (int) n_drafted_last, (int) n_accepted, (int) pos_max_tgt, (int) trim_from,
                             (int) (pos_max_tgt - trim_from + 1));
+                } else {
+                    // The raw llama_memory_seq_rm above bypasses llama_context_seq_rm(),
+                    // which is what invalidates the cross-ubatch MTP pending stash on the
+                    // target. After a rejection the target frontier moves BACKWARD while
+                    // mtp.pending_pos still points past the trimmed rows; the next
+                    // handle_mtp_for_ubatch() then sees pending_pos + 1 != pos_start,
+                    // discards the stash, and the draft head is never seeded again —
+                    // a permanent MTP desync that collapses into a repetition loop at
+                    // high context (the 7ad6216b6 "fixed token forever" signature).
+                    // Reset the stash here so the next batch re-seeds from the trimmed
+                    // frontier instead of mismatching forever.
+                    llama_reset_mtp_pending(ctx_tgt);
                 }
             }
         }

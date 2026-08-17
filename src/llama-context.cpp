@@ -3607,6 +3607,11 @@ void llama_set_mtp(struct llama_context * ctx_target, struct llama_context * ctx
     ctx_target->set_mtp(ctx_mtp);
 }
 
+void llama_reset_mtp_pending(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->reset_mtp_pending();
+}
+
 void llama_context::set_mtp(llama_context * ctx_mtp_in) {
     if (mtp.ctx_mtp == ctx_mtp_in) return;
 
@@ -3880,12 +3885,17 @@ bool llama_context_seq_rm(
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
         llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
-        // Full clear (p0<=0, p1<0) invalidates the cross-ubatch pending stash:
-        // ctx_mtp has no valid positions, so a stale pending_h would pair the
-        // wrong hidden state with the first token of the next prefill.
-        if (p0 <= 0 && p1 < 0) {
-            ctx_mtp->reset_mtp_pending();
-        }
+        // Any target memory mutation can move the frontier under the
+        // cross-ubatch pending stash. A stale pending_h/pending_pos would
+        // pair the wrong hidden state with the first token of the next
+        // prefill/decode, so unconditionally invalidate it here. The cost of
+        // a spurious reset is one missed draft continuation; the cost of a
+        // stale stash is a permanent MTP desync that collapses into a
+        // repetition loop at high context (7ad6216b6 "fixed token forever").
+        // NOTE: the stash lives on the TARGET context (handle_mtp_for_ubatch
+        // reads this->mtp.pending_pos during target decode), not on the
+        // shadow — reset the target here.
+        ctx->reset_mtp_pending();
     }
     return ok;
 }
@@ -3909,6 +3919,10 @@ void llama_context_seq_cp(
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
         llama_memory_seq_cp(llama_get_memory(ctx_mtp), seq_id_src, seq_id_dst, p0, p1);
+        // Positions were copied/overwritten — the cross-ubatch pending stash
+        // on the target no longer points at a valid frontier. Invalidate it
+        // (see llama_context_seq_rm for the rationale).
+        ctx->reset_mtp_pending();
     }
 }
 
@@ -3961,6 +3975,10 @@ void llama_context_seq_add(
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
         llama_memory_seq_add(llama_get_memory(ctx_mtp), 0, p0, p1, delta);
+        // Positions shifted by delta — the cross-ubatch pending stash on the
+        // target no longer points at a valid frontier. Invalidate it
+        // (see llama_context_seq_rm for the rationale).
+        ctx->reset_mtp_pending();
     }
 }
 
