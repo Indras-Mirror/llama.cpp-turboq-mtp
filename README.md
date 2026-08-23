@@ -1,4 +1,15 @@
-# llama.cpp-TurboQuant-DSV4 — Fused TBQ4 Flash Attention + MTP + DSV4 Native TBQ4
+# llama.cpp-TurboQuant-DSV4 — Fused TBQ4 Flash Attention + MTP + DSV4 Native TBQ4 + Qwen35 SWA Hybrid (turboq-mtp-swa)
+
+> **Headline (2026-08-23): Qwen35 SWA Hybrid (turboq-mtp-swa)** — Sliding-Window Attention for
+> Qwen3.8-27B (arch `qwen35`, Gated-DeltaNet hybrid). Windows the bulk of the full-attention
+> (non-recurrent, `il%4==3`) trunk layers so **decode stays bounded at deep context**, while
+> `qwen35.attention.swa_global_layers` of them stay **GLOBAL** (dense, full context) for
+> long-range verbatim recall. Gating is balanced (Bresenham), mirroring `muse-glimmer`; the MTP
+> draft head stays dense. Swept `swa_global_layers` 2/4/8/13 → **N=8 is the optimum: correct
+> beyond-window recall AND the fastest decode (~70 t/s @ 62K, MTP accept 1.00)**; N=2/4 fail
+> beyond-window recall, N=13 recalls but is slower (~59 t/s). Tunable via
+> `--override-kv qwen35.attention.swa_global_layers=int:N` (default 8) or the wrapper flag
+> `--swa-global-layers=N`. See the SWA section below; wrapper `qwen3.8-quetza-agg-swa --swa=8192`.
 
 > **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org lineage, b10217 rebase base `a7a6d0d26`) combining TurboQuant KV cache (TBQ3/TBQ4), RotorQuant, MTP speculative decoding, and — the headline of this repo — **DSV4 native TBQ4 KV cache via dequant-at-read** (Option A): DeepSeek-V4-Flash KV cache stored natively as TBQ4_0 and dequantized at read time, no Q8_0 fallback, no separate dequant pass.
 
