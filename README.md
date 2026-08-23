@@ -20,6 +20,31 @@
 
 ---
 
+## Qwen35 SWA Hybrid (turboq-mtp-swa)
+
+Sliding-Window Attention for **Qwen3.8-27B** (arch `qwen35`, a Gated-DeltaNet hybrid). Windows
+the bulk of the full-attention (non-recurrent, `il%4==3`) trunk layers to a sliding window so
+**decode stays bounded at deep context**, while `qwen35.attention.swa_global_layers` of them stay
+**GLOBAL** (dense, full context) for long-range verbatim recall. Gating is balanced (Bresenham)
+over the full-attention layers, mirroring `muse-glimmer`; the MTP/draft head stays dense.
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `qwen35.attention.sliding_window` | `4096` | bounds decode (prefill unchanged) |
+| `qwen35.attention.swa_global_layers` | `8` | full-attn layers kept GLOBAL |
+
+Swept `swa_global_layers` = 2 / 4 / 8 / 13 at deep ctx (beyond-window recall ~10K back + decode
+~62K ctx): **N=8 is the optimum — the smallest count with correct recall AND the fastest decode
+(69.99 t/s @ 62K, MTP draft acceptance 1.00).** N=2/4 fail beyond-window recall (their MTP
+acceptance collapses → long hedging thinking); N=13 recalls but is slower (59.25 t/s).
+
+- Tunable via `--override-kv qwen35.attention.swa_global_layers=int:N` or the wrapper flag
+  `--swa-global-layers=N`.
+- MTP graph must keep the ISWA builders (`graph_mtp`) or `swa_type!=NONE` asserts.
+- Wrapper: `qwen3.8-quetza-agg-swa --swa=8192`. Build: `cmake --build build -j4 --target llama-server`.
+
+---
+
 ## DSV4 Native TBQ4 — v2 Strided-Quantized Concat
 
 Upstream of this work, DSV4 fell back from TBQ quantization to Q8_0 because the DSV4 model path had no TBQ dequant support. This commit (`1a663e2d0`) removes that fallback and stores TBQ4_0 natively in all four DSV4 KV caches (lid, csa raw+csa, hca raw+hca). A `dequant_k_read` helper casts TBQ3/TBQ4 blocks to F32 and reshapes to 4D at the three read sites; the raw ratio-0 site keeps the fused `MMA_TBQ4` path, and the Q8_0 path is byte-identical (the helper is a passthrough there).
