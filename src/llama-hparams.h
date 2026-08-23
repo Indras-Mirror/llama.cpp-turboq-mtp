@@ -160,6 +160,9 @@ struct llama_hparams {
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
+    // how many of the full-attention (non-recurrent) layers stay GLOBAL (dense, full-atttention)
+    // instead of windowed. Tuned via --override-kv <arch>.attention.swa_global_layers=int:N.
+    uint32_t swa_global_layers = 13;   // match glimmer's 13/52 global ratio
 
     // if is_swa_impl[il] == 1, then layer il is SWA
     // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)

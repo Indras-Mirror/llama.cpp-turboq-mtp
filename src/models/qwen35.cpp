@@ -26,6 +26,51 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // Sliding-window attention (SWA). qwen35 is a Gated-DeltaNet hybrid: only the
+    // full-attention (non-recurrent) trunk layers receive a sliding window. The
+    // generic set_swa_pattern() keys the pattern off il % 4, but here recurrence
+    // occupies il%4 ∈ {0,1,2} and full-attention lives at il%4 == 3 (see
+    // is_recr_impl above) — naively applied that would invert the intent and leave
+    // zero full-attention layers windowed. So window a layer iff !is_recr(il), and
+    // leave the MTP/draft layers dense.
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+    ml.get_key(LLM_KV_QWEN35_SWA_GLOBAL_LAYERS, hparams.swa_global_layers, false);
+    if (hparams.n_swa > 0) {
+        // SWA only if a positive window was provided; else leave swa_type=NONE
+        // so create_memory takes the clean dense path (no ISWA, no MTP assert).
+        //
+        // Hybrid: window MOST full-attention layers for decode speed, but keep the
+        // LAST swa_global_layers of them GLOBAL (dense, full attention) so
+        // long-range verbatim recall survives. Layer ORDER matters: the late layers
+        // do the answer synthesis across the whole context, so they should stay
+        // global; the early layers are local/cheap and get windowed. The MTP head
+        // stays dense.
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        uint32_t fullattn_total = 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (!hparams.is_recr(il)) { ++fullattn_total; }
+        }
+        // BALANCED (glimmer-style): keep `swa_global_layers` full-attn layers GLOBAL
+        // but distribute them evenly across the stack (Bresenham) so there is a global
+        // path at regular intervals (not a block at one end). Window the rest for speed.
+        const uint32_t n_global = hparams.swa_global_layers < fullattn_total
+                ? hparams.swa_global_layers : fullattn_total;
+        uint32_t fullattn_seen = 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il)) {
+                hparams.is_swa_impl[il] = 0;              // delta-net: not an attention layer
+            } else {
+                ++fullattn_seen;
+                uint32_t g_before = ((fullattn_seen - 1) * n_global) / fullattn_total;
+                uint32_t g_after  = ( fullattn_seen       * n_global) / fullattn_total;
+                hparams.is_swa_impl[il] = (g_after > g_before) ? 0 : 1;  // 0=global,1=windowed
+            }
+        }
+    }
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.is_swa_impl[il] = 0;
+    }
+
     switch (hparams.n_layer()) {
         case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
         case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
@@ -150,7 +195,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    auto * inp = build_inp_mem_hybrid_iswa();
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -256,7 +301,7 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
-        llm_graph_input_attn_kv * inp,
+        llm_graph_input_attn_kv_iswa * inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
@@ -538,7 +583,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    auto * inp_attn = build_attn_inp_kv_iswa();
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
