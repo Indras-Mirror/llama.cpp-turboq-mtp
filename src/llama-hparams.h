@@ -145,7 +145,9 @@ struct llama_hparams {
     uint32_t n_swa = 0;
     // how many of the full-attention (non-recurrent) layers stay GLOBAL (dense, full-atttention)
     // instead of windowed. Tuned via --override-kv <arch>.attention.swa_global_layers=int:N.
-    uint32_t swa_global_layers = 13;   // match glimmer's 13/52 global ratio
+    // Default 8 = qwen35 tuned optimum (swept 2/4/8/13 at ~62K ctx: smallest N with correct
+    // beyond-window recall AND fastest decode, ~70 t/s). 13 was the muse-glimmer ratio.
+    uint32_t swa_global_layers = 8;
 
     // if is_swa_impl[il] == 1, then layer il is SWA
     // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)

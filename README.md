@@ -17,7 +17,7 @@ Sliding-Window Attention for **Qwen3.8-27B** (arch `qwen35`, a Gated-DeltaNet hy
 
 **Tunable** via `--override-kv qwen35.attention.swa_global_layers=int:N` (and `--override-kv qwen35.attention.sliding_window=int:N`), or the wrapper flag `--swa-global-layers=N`. Wrapper: `qwen3.8-quetza-agg-swa`.
 
-> The wrapper's default is `swa_global_layers=8`. If you load a Qwen3.8 model **bare** (no override and no `swa_global_layers` GGUF metadata), the in-tree fallback is `13` (the `muse-glimmer` ratio) — pass the override explicitly to pin your config.
+> The default `swa_global_layers=8` matches the tuned optimum in both the wrapper (`--swa-global-layers=8`) and the in-tree fallback for a bare model load. Pass an override to pin a different config.
 
 ### How it works
 
