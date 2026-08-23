@@ -17,6 +17,7 @@
 | **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from the dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
 | **RotorQuant (PlanarQuant + IsoQuant)** | 4 new 3-bit/4-bit KV cache types using Givens/quaternion rotations — faster dequant, better compression | Working |
+| **Qwen35 SWA Hybrid (turboq-mtp-swa)** | Sliding-Window Attention for Qwen3.8-27B (qwen35, Gated-DeltaNet hybrid): windows most full-attn layers so decode stays bounded at deep context, keeps `swa_global_layers=8` GLOBAL for long-range recall. N=8 = optimum (correct beyond-window recall + ~70 t/s @ 62K, MTP accept 1.00) | Working |
 
 ---
 
