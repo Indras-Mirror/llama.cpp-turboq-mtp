@@ -22,8 +22,8 @@
 | Feature | Description | Status |
 |---------|-------------|--------|
 | **DSV4 Native TBQ4 KV Cache (dequant-at-read)** | DeepSeek-V4-Flash KV stored natively as TBQ4_0; v2 strided-quantized concat kernel bypasses F32 dequant at csa/hca sites (2.16x speedup at 512K). Lid site still dequants at read. | ✅ **Headline — this work** |
-| **Fused TBQ4 Flash Attention** | Quantized-KV dequant inside the FA inner loop via rotated-domain attention (centroid lookup, no intermediate F16 buffer) | Working, 82+ tok/s (Qwen3.6) |
-| **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673 lineage) with 3 draft tokens per forward pass; custom implementation kept (see below) | Working, 73-98% accept |
+| **Fused TBQ4 Flash Attention** | Quantized-KV dequant inside the FA inner loop via rotated-domain attention (centroid lookup, no intermediate F16 buffer) | Working, 82+ tok/s (Qwen3.6) · ~70 t/s @ 62K SWA (Qwen3.8) |
+| **MTP Speculative Decoding** | Multi-Token Prediction for Qwen3.6 (PR #22673 lineage, 3 draft tokens) + Qwen3.8 draft-mtp (embedded head, own TBQ4 draft KV, ~74 t/s @ 262K) | Working, 73-98% accept (Qwen3.6) · accept 1.00 @ 62K SWA (Qwen3.8) |
 | **Fused TBQ3 Flash Attention** | 3-bit KV compression (3.0625 bpv, ~24% smaller than TBQ4), fused inline dequant. Mixed TBQ4+TBQ3 via DSV4_CTK_COMP | Working — validated 2026-08-03 (GPU KV) |
 | **CUDA TBQ4_0 Kernels** | FWHT-based TurboQuant quantize/dequant on GPU (ported from the dflash fork) | Working |
 | **Tensor Sharing API** | `link_shared_tensors()` prevents 682 MiB GPU duplication of token embeddings between trunk and MTP models | Working |
@@ -164,6 +164,13 @@ The draft KV type is set separately from the main cache: `--spec-draft-type-k` /
 | Prompt processing | 452 t/s |
 | VRAM total | 20,637 MiB (3.9 GiB headroom, no OOM) |
 | Native tool_use probe | clean (`stop_reason: tool_use`) |
+
+**SWA Hybrid (turboq-mtp-swa) — current Qwen3.8 config (2026-08-23):** adding Sliding-Window
+Attention (windows most full-attention layers, keeps `swa_global_layers=8` GLOBAL) keeps deep-context
+decode cheap **and** preserves long-range verbatim recall. Measured on Qwen3.8-27B Q4_K_P (TBQ4 KV,
+MTP draft): **beyond-window recall correct** (~10K back), **decode ~70 t/s @ 62K with MTP accept 1.00**;
+a live wrapper run did a 43K-token prefill at ~635 t/s and decoded ~2K tokens at ~52 t/s. Tunable via
+`--override-kv qwen35.attention.swa_global_layers=int:N` (default 8) or `qwen3.8-quetza-agg-swa --swa-global-layers=N`.
 
 ---
 
