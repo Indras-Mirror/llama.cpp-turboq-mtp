@@ -33,7 +33,10 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     // is_recr_impl above) — naively applied that would invert the intent and leave
     // zero full-attention layers windowed. So window a layer iff !is_recr(il), and
     // leave the MTP/draft layers dense.
-    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+    // SWA is OPTIONAL. A GGUF that omits qwen35.attention.sliding_window (e.g. a
+    // dense / full-attention export) must load with swa_type=NONE and the clean
+    // dense path, not fail to load. The guard below already handles n_swa == 0.
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
     ml.get_key(LLM_KV_QWEN35_SWA_GLOBAL_LAYERS, hparams.swa_global_layers, false);
     if (hparams.n_swa > 0) {
         // SWA only if a positive window was provided; else leave swa_type=NONE
