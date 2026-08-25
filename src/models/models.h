@@ -2258,8 +2258,11 @@ struct llama_model_qwen35 : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
+        // AttnInp is llm_graph_input_attn_kv_iswa* for SWA models and
+        // llm_graph_input_attn_kv* for dense (swa_type=NONE) exports; the body is identical.
+        template <typename AttnInp>
         ggml_tensor * build_layer_attn(
-        llm_graph_input_attn_kv_iswa * inp_attn,
+                    AttnInp * inp_attn,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,

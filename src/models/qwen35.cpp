@@ -182,129 +182,11 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     return std::make_unique<graph>(*this, params);
 }
 
-llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), model(model) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
-    int sections[4];
-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
-
-    ggml_tensor * cur;
-    ggml_tensor * inpL;
-
-    inpL = build_inp_embd(model.tok_embd);
-
-    cb(inpL, "model.input_embed", -1);
-
-    auto * inp = build_inp_mem_hybrid_iswa();
-
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
-
-        ggml_tensor * inpSA = inpL;
-
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
-
-        ggml_build_forward_expand(gf, cur);
-
-        // Determine layer type and build appropriate attention mechanism
-        if (hparams.is_recr(il)) {
-            // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
-        } else {
-            // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
-        }
-
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
-            cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-        }
-
-        // Residual connection
-        cur = ggml_add(ctx0, cur, inpSA);
-        cb(cur, "attn_residual", il);
-
-        // Save the tensor before post-attention norm for residual connection
-        ggml_tensor * ffn_residual = cur;
-
-        // Post-attention norm
-        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
-        cb(attn_post_norm, "attn_post_norm", il);
-
-        // Dense FFN layer - without residual connection
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
-
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
-        cb(cur, "post_ffn", il);
-
-        cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
-
-        // Input for next layer
-        inpL = cur;
-    }
-    cur = inpL;
-
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
-
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
-}
-
-std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
-                ggml_tensor * input,
-                        int   il) {
-    const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
-
-    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
-    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
-    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
-    cb(z, "z", il);
-
-    return { qkv_mixed, z };
-}
-
-ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
-        ggml_tensor * input,
-        ggml_tensor * weights,
-        ggml_tensor * gate,
-        int           layer) {
-    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
-
-    return ggml_mul(ctx0, normalized, gated_silu);
-}
-
+// AttnInp is llm_graph_input_attn_kv_iswa* for SWA models and llm_graph_input_attn_kv*
+// for dense (swa_type=NONE) exports; the two build_attn overloads are called below.
+template <typename AttnInp>
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
-        llm_graph_input_attn_kv_iswa * inp,
+        AttnInp *                 inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
@@ -382,6 +264,136 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(cur, "attn_output", il);
 
     return cur;
+}
+
+llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
+    llm_build_delta_net_base(params), model(model) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    ggml_tensor * cur;
+    ggml_tensor * inpL;
+
+    inpL = build_inp_embd(model.tok_embd);
+
+    cb(inpL, "model.input_embed", -1);
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+    // The attention input variant must match the memory that was created for this model:
+    //   * SWA models   -> llama_memory_hybrid_iswa  -> build_inp_mem_hybrid_iswa()
+    //   * dense export -> llama_memory_hybrid       -> build_inp_mem_hybrid()
+    // (gated delta net / recurrent input, llm_graph_input_rs, is identical for both).
+    auto run_layers = [&](auto * inp) {
+        for (int il = 0; il < n_layer; ++il) {
+            res->t_layer_inp[il] = inpL;
+
+            ggml_tensor * inpSA = inpL;
+
+            cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+
+            ggml_build_forward_expand(gf, cur);
+
+            // Determine layer type and build appropriate attention mechanism
+            if (hparams.is_recr(il)) {
+                // Linear attention layer (gated delta net)
+                cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            } else {
+                // Full attention layer
+                cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            }
+
+            if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+                cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            // Residual connection
+            cur = ggml_add(ctx0, cur, inpSA);
+            cb(cur, "attn_residual", il);
+
+            // Save the tensor before post-attention norm for residual connection
+            ggml_tensor * ffn_residual = cur;
+
+            // Post-attention norm
+            ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+            cb(attn_post_norm, "attn_post_norm", il);
+
+            // Dense FFN layer - without residual connection
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
+
+            // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+            cur = ggml_add(ctx0, cur, ffn_residual);
+            cb(cur, "post_ffn", il);
+
+            cur = build_cvec(cur, il);
+            cb(cur, "l_out", il);
+
+            // Input for next layer
+            inpL = cur;
+        }
+    };
+    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        run_layers(build_inp_mem_hybrid_iswa());
+    } else {
+        run_layers(build_inp_mem_hybrid());
+    }
+    cur = inpL;
+
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    // LM head
+    cur = build_lora_mm(model.output, cur, model.output_s);
+
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
+                ggml_tensor * input,
+                        int   il) {
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    cb(z, "z", il);
+
+    return { qkv_mixed, z };
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
+        ggml_tensor * input,
+        ggml_tensor * weights,
+        ggml_tensor * gate,
+        int           layer) {
+    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
+
+    return ggml_mul(ctx0, normalized, gated_silu);
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
@@ -586,8 +598,6 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv_iswa();
-
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
@@ -643,9 +653,23 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    // The MTP attention input must match the memory created for this MTP context
+    // (see llama_model::create_memory): SWA models get a llama_kv_cache_iswa_context
+    // -> build_attn_inp_kv_iswa(); dense exports (swa_type=NONE) get a plain
+    // llama_kv_cache_context -> build_attn_inp_kv(). build_attn_inp_kv_iswa()
+    // static_casts mctx to llama_kv_cache_iswa_context and dereferences a garbage
+    // pointer (llama-graph.cpp:3120) for a dense MTP context, so it must not run
+    // when swa_type == LLAMA_SWA_TYPE_NONE.
+    auto build_mtp_attn = [&](auto * inp) {
+        cur = build_attn(inp,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    };
+    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        build_mtp_attn(build_attn_inp_kv_iswa());
+    } else {
+        build_mtp_attn(build_attn_inp_kv());
+    }
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
