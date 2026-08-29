@@ -117,6 +117,21 @@ static int test_vec_dot_f32(bool verbose) {
         generate_data(0.0, n, a.data());
         generate_data(1.0, n, b.data());
 
+        float result = 0.0f;
+        f32->vec_dot(n, &result, 0, a.data(), 0, b.data(), 0, 1);
+        const float ref = dot_product(a.data(), b.data(), n);
+        const float error = fabsf(result - ref) / n;
+
+        const bool failed = !(error < MAX_QUANTIZATION_REFERENCE_ERROR);
+        num_failed += failed;
+        if (failed || verbose) {
+            printf(" f32 vec_dot n=%4d:                 %s (ref=%f got=%f err=%f)\n",
+                   n, RESULT_STR[failed], ref, result, error);
+        }
+    }
+    return num_failed;
+}
+
 static bool test_turboq_vec_dot_dispatch() {
     for (ggml_type type : { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0 }) {
         const auto * qfns_cpu = ggml_get_type_traits_cpu(type);
@@ -150,21 +165,6 @@ static bool test_tbq3_norm_scaling() {
     quantize_row_tbq3_0_ref(x.data(), &block, QK_K);
 
     return fabsf(ggml_fp16_to_fp32(block.d) - 16.0f) < 1e-3f;
-}
-
-        float result = 0.0f;
-        f32->vec_dot(n, &result, 0, a.data(), 0, b.data(), 0, 1);
-        const float ref = dot_product(a.data(), b.data(), n);
-        const float error = fabsf(result - ref) / n;
-
-        const bool failed = !(error < MAX_QUANTIZATION_REFERENCE_ERROR);
-        num_failed += failed;
-        if (failed || verbose) {
-            printf(" f32 vec_dot n=%4d:                 %s (ref=%f got=%f err=%f)\n",
-                   n, RESULT_STR[failed], ref, result, error);
-        }
-    }
-    return num_failed;
 }
 
 static int test_vec_dot_q(bool verbose) {
