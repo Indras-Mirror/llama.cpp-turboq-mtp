@@ -52,8 +52,17 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // The indexer K is consumed by ggml_get_rows (build_qsa_top_k mean-pools whole
+        // blocks of it), and the CUDA get_rows path has no TBQ3_0/TBQ4_0 source case, so a
+        // TBQ4 indexer K is CPU-routed and the scheduler force-reads it back to host (crash).
+        // The indexer is a small per-token scoring key cache; keep it out of TBQ so get_rows
+        // stays on GPU and the scores come out in the un-rotated domain. The main attention
+        // KV cache still uses type_k/type_v.
+        const ggml_type idx_type_k =
+            (type_k == GGML_TYPE_TBQ3_0 || type_k == GGML_TYPE_TBQ4_0) ? GGML_TYPE_F16 : type_k;
+
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, idx_type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
