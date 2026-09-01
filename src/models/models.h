@@ -2329,8 +2329,12 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // AttnInp is llm_graph_input_attn_kv_iswa* for SWA models and
+        // llm_graph_input_attn_kv* for dense (swa_type=NONE) exports; the body is identical
+        // apart from the final build_attn dispatch (QSA is absent on an iswa memory).
+        template <typename AttnInp>
         ggml_tensor * build_layer_attn(
-              llm_graph_input_attn_kv * inp_attn,
+                    AttnInp * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
@@ -2388,7 +2392,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         ggml_tensor * build_inp_ple(
-  const llama_memory_hybrid_idx_context * mctx_hyb);
+  const llama_kv_cache_context * attn_ctx);
 
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,

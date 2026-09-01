@@ -2482,8 +2482,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
+                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0 &&
+                                hparams.swa_type == LLAMA_SWA_TYPE_NONE) {
+                            // QSA runs on the dense-attention layers only, and only on the
+                            // non-SWA path: an iswa (SWA) memory has no indexer interface.
                             filter_idx = [&](uint32_t il) {
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };

@@ -1,10 +1,12 @@
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <type_traits>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -100,6 +102,47 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
+    }
+
+    // Sliding-window attention (SWA), optional and opt-in, mirroring qwen35. Only the
+    // full-attention (non-recurrent) trunk layers that are NOT QSA-indexed receive a window;
+    // QSA layers stay global (QSA already bounds them), recurrent layers are not attention
+    // layers, and the MTP/draft layers stay dense. A GGUF without
+    // qwen4exp.attention.sliding_window (n_swa == 0) loads with swa_type=NONE and keeps the
+    // clean dense path. SWA is opt-in: with an override only, n_swa > 0.
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+    // the shared SWA_GLOBAL_LAYERS key resolves to %s.attention.swa_global_layers, i.e.
+    // qwen4exp.attention.swa_global_layers for this arch, so no new constant is needed.
+    ml.get_key(LLM_KV_QWEN35_SWA_GLOBAL_LAYERS, hparams.swa_global_layers, false);
+    if (hparams.n_swa > 0) {
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+
+        // swa-eligible = full-attention (non-recurrent) AND non-QSA trunk layers
+        uint32_t swa_eligible = 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (!hparams.is_recr(il) && hparams.dsv4_compress_ratios[il] == 0) {
+                ++swa_eligible;
+            }
+        }
+        const uint32_t n_global = hparams.swa_global_layers < swa_eligible
+                ? hparams.swa_global_layers : swa_eligible;
+        // BALANCED (glimmer-style): keep n_global swa-eligible layers GLOBAL (dense, full
+        // attention) distributed evenly via Bresenham so a global path survives at regular
+        // intervals; window the rest. Recurrent and QSA layers stay GLOBAL.
+        uint32_t swa_seen = 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il) || hparams.dsv4_compress_ratios[il] > 0) {
+                hparams.is_swa_impl[il] = 0;   // recurrent or QSA: never windowed
+            } else {
+                ++swa_seen;
+                uint32_t g_before = ((swa_seen - 1) * n_global) / swa_eligible;
+                uint32_t g_after  = ( swa_seen       * n_global) / swa_eligible;
+                hparams.is_swa_impl[il] = (g_after > g_before) ? 0 : 1;  // 0=global,1=windowed
+            }
+        }
+    }
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.is_swa_impl[il] = 0;
     }
 
     switch (hparams.n_layer()) {
@@ -465,27 +508,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(inpL, "model.input_embed", -1);
     ggml_build_forward_expand(gf, inpL);
 
-    auto * inp = build_inp_mem_hybrid();
-
-    // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
-    // the indexer cache inside it is absent when the GGUF has no indexer tensors
-    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
-
-    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
-    if (mctx_idx) {
-        GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
-                "the indexer cache must track the attention cache cell for cell");
-    }
-
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-
-    ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
-        // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
-    }
 
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
@@ -493,45 +517,95 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
 
-    for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
-
-        if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+    // run_layers is templated on the memory-input type so the same body compiles for both
+    // the idx (baseline, QSA) and iswa (SWA) memories. A null mctx_hyb marks the SWA path:
+    // the QSA indexer block is skipped (there is no indexer cache on an iswa memory).
+    auto run_layers = [&](auto * inp, const llama_memory_hybrid_idx_context * mctx_hyb) {
+        ggml_tensor * ple_emb = nullptr;
+        if (hparams.ple_n_heads > 0) {
+            // PLE gathers its predecessor tokens from a FULL-retention attention cache:
+            //   * idx path    -> mctx_hyb->get_attn()   (the single dense cache, as before)
+            //   * iswa (SWA)  -> the base cache, which is the full-retention dense/global
+            //     split an iswa memory does NOT window. The recurrent lane that PLE actually
+            //     runs on (build_ple) is already never windowed, and the base cache is a
+            //     superset of the swa cache, so it supplies the complete token history.
+            const llama_kv_cache_context * ple_attn = nullptr;
+            if (mctx_hyb != nullptr) {
+                ple_attn = mctx_hyb->get_attn();
+            } else if constexpr (std::is_same_v<decltype(inp), llm_graph_input_mem_hybrid_iswa *>) {
+                if (const auto * inp_attn_iswa = inp->get_attn()) {
+                    ple_attn = inp_attn_iswa->mctx->get_base();
+                    GGML_ASSERT(ple_attn->get_n_kv() > 0 &&
+                            "PLE on an SWA (iswa) memory needs a non-empty base cache: "
+                            "swa_global_layers == 0 leaves no global (un-windowed) attention layer");
+                }
+            }
+            GGML_ASSERT(ple_attn != nullptr && "PLE requires an attention cache");
+            ple_emb = build_inp_ple(ple_attn);
+            // make sure ple_emb and build_inp_embd are in the same graph split
+            ggml_build_forward_expand(gf, ple_emb);
         }
 
-        ggml_tensor * inject = nullptr;
-        ggml_tensor * cur = build_hc_mix(res_hc,
-                model.layers[il].hc_attn_norm,
-                model.layers[il].hc_attn_down,
-                model.layers[il].hc_attn_up,
-                model.layers[il].hc_attn_inject,
-                &inject, il);
+        for (int il = 0; il < n_layer; ++il) {
+            res->t_layer_inp[il] = res_hc;
 
-        ggml_build_forward_expand(gf, cur);
+            if (hparams.is_ple(il)) {
+                res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+            }
 
-        if (hparams.is_recr(il)) {
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
-        } else {
-            cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+            ggml_tensor * inject = nullptr;
+            ggml_tensor * cur = build_hc_mix(res_hc,
+                    model.layers[il].hc_attn_norm,
+                    model.layers[il].hc_attn_down,
+                    model.layers[il].hc_attn_up,
+                    model.layers[il].hc_attn_inject,
+                    &inject, il);
+
+            ggml_build_forward_expand(gf, cur);
+
+            if (hparams.is_recr(il)) {
+                cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            } else {
+                cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+            }
+
+            res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+            cur = build_hc_mix(res_hc,
+                    model.layers[il].hc_ffn_norm,
+                    model.layers[il].hc_ffn_down,
+                    model.layers[il].hc_ffn_up,
+                    model.layers[il].hc_ffn_inject,
+                    &inject, il);
+
+            cur = build_layer_ffn(cur, il);
+            cb(cur, "ffn_out", il);
+
+            res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+            // "l_last" is the layer output name that build_cvec and imatrix look for
+            cb(res_hc, "l_last", il);
         }
+    };
 
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
+    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        // SWA memory: llama_memory_hybrid_iswa, no indexer/QSA. Windowed layers route to the
+        // swa cache and the swa_global_layers / QSA layers to the base cache by is_swa(il)
+        // inside the iswa build_attn overload.
+        auto * inp = build_inp_mem_hybrid_iswa();
+        run_layers(inp, nullptr);
+    } else {
+        // Baseline (dense or QSA): llama_memory_hybrid_idx, so this downcast is safe.
+        // The indexer cache inside it is absent when the GGUF has no indexer tensors.
+        auto * inp = build_inp_mem_hybrid();
+        const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
 
-        cur = build_hc_mix(res_hc,
-                model.layers[il].hc_ffn_norm,
-                model.layers[il].hc_ffn_down,
-                model.layers[il].hc_ffn_up,
-                model.layers[il].hc_ffn_inject,
-                &inject, il);
-
-        cur = build_layer_ffn(cur, il);
-        cb(cur, "ffn_out", il);
-
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
-
-        // "l_last" is the layer output name that build_cvec and imatrix look for
-        cb(res_hc, "l_last", il);
+        const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+        if (mctx_idx) {
+            GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                    "the indexer cache must track the attention cache cell for cell");
+        }
+        run_layers(inp, mctx_hyb);
     }
 
     // Hand the wide residual to an MTP head before the final mix collapses it. The draft
@@ -871,8 +945,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     return cur;
 }
 
+template <typename AttnInp>
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
-        llm_graph_input_attn_kv * inp,
+        AttnInp * inp,
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
@@ -937,12 +1012,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (top_k) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
-    } else {
+    if constexpr (std::is_same<AttnInp, llm_graph_input_attn_kv_iswa>::value) {
+        // SWA memory: no QSA indexer. build_attn dispatches to the iswa overload, which
+        // routes the layer to the base (global/dense) or swa (windowed) cache per is_swa(il).
+        GGML_ASSERT(!qsa && "qwen4exp: QSA must not run on an iswa (SWA) memory");
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    } else {
+        if (top_k) {
+            cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
+        } else {
+            cur = build_attn(inp,
+                        nullptr, nullptr, nullptr,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        }
     }
     cb(cur, "attn_pregate", il);
 
@@ -1147,7 +1231,13 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override {
-        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        if (const auto * m = dynamic_cast<const llama_memory_hybrid_idx_context *>(params.mctx)) {
+            mctx = m->get_attn();
+        } else if (const auto * m = dynamic_cast<const llama_memory_hybrid_iswa_context *>(params.mctx)) {
+            mctx = m->get_attn()->get_base();
+        } else {
+            return false;
+        }
         return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
@@ -1274,12 +1364,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
-        const llama_memory_hybrid_idx_context * mctx_hyb) {
+        const llama_kv_cache_context * attn_ctx) {
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+            static_cast<const llama_model_qwen4exp &>(model), attn_ctx);
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
