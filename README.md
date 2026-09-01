@@ -9,6 +9,13 @@ plus **multi-token-prediction (MTP)**, **PLE n-gram support on the SWA path**, a
 > Measured here (TBQ4, 4096 window, 8 global layers): decode **22.8 t/s @ 12k → 15.7 t/s @ 100k**,
 > and a code planted at position 0 is **recalled exactly at 100k** — the windowed layers bound
 > the cost while the 8 global layers + DeltaNet recurrent path retain the context.
+>
+> **Which branch is this?** `qwen4-swa` = the **Qwen4-Exp (qwen4exp)** extension, and this repo's
+> **default** branch. `master` = the **Qwen35 hybrid** build (Qwen3.8-27B SWA, the ~94-star
+> TurboQuant/TBQ4 fork, a.k.a. the "mtp-fixes" master) on upstream base `a7a6d0d26`. `qwen4-swa` is
+> **rebased on newer upstream (`d7bd3bfca`)**, so the two branches share the same *recipe* but not the
+> same history — they do **not** merge cleanly. `master` is the Qwen35 build; this branch is the
+> Qwen4-Exp build. Both live in `Indras-Mirror/llama.cpp-turboq-mtp`.
 
 ---
 
