@@ -50,7 +50,12 @@ static uint32_t server_n_outputs_max(const common_params & params) {
 
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
-    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+    uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+
+    if (params.n_seq_extra > 0) {
+        // /decide scores many branch rows per decode; the context also requires >= n_seq_max
+        n_outputs = std::max<uint64_t>({n_outputs, (uint64_t) (params.n_parallel + params.n_seq_extra), 256});
+    }
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
@@ -1324,7 +1329,8 @@ private:
             slots.emplace_back();
         }
 
-        decide.init(ctx_tgt, model_tgt, params_base.n_parallel, params_base.n_seq_extra, params_base.cpuparams.n_threads);
+        decide.init(ctx_tgt, model_tgt, params_base.n_parallel, params_base.n_seq_extra, params_base.cpuparams.n_threads,
+                    (int) server_n_outputs_max(params_base));
         if (decide.enabled()) {
             SRV_INF("/decide enabled: %d reserved sequences (ids %d..%d)\n",
                     params_base.n_seq_extra, params_base.n_parallel, params_base.n_parallel + params_base.n_seq_extra - 1);

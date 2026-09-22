@@ -27,9 +27,10 @@ struct server_decide {
     int  seq0           = 0; // first reserved sequence id
     int  n_seqs         = 0; // number of reserved sequence ids (0 = disabled)
     int  n_threads      = 4;
+    int  n_outputs_max  = 256; // output rows allowed per llama_decode (context limit)
     bool recurrent_like = false;
 
-    void init(llama_context * ctx, const llama_model * model, int seq0, int n_seqs, int n_threads);
+    void init(llama_context * ctx, const llama_model * model, int seq0, int n_seqs, int n_threads, int n_outputs_max);
 
     bool enabled() const { return n_seqs >= 3; }
 

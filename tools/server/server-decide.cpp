@@ -48,9 +48,14 @@ struct decide_branch {
 
 // decode runs chunked to n_batch; on_chunk(map) is called after each llama_decode,
 // with map[i] = (run index, token index) for batch row i
+// atomic = n_ubatch for recurrent/hybrid models: every llama_decode call then holds only whole
+// runs totalling <= n_ubatch tokens (a longer run is decoded alone), so llama.cpp never splits a
+// sequence across ubatches next to other sequences -- that corrupts recurrent state for sequences
+// copied from a shared parent. 0 = pack freely up to n_batch.
 template <typename F>
-void decode_runs(llama_context * ctx, const std::vector<decide_run> & runs, F && on_chunk) {
+void decode_runs(llama_context * ctx, int n_outputs_max, int atomic, const std::vector<decide_run> & runs, F && on_chunk) {
     const int n_batch = (int) llama_n_batch(ctx);
+    int n_out = 0; // output rows in the current batch
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::vector<std::pair<int, int>> map;
     auto flush = [&]() {
@@ -64,14 +69,24 @@ void decode_runs(llama_context * ctx, const std::vector<decide_run> & runs, F &&
         }
         on_chunk(map);
         batch.n_tokens = 0;
+        n_out = 0;
         map.clear();
     };
     for (int r = 0; r < (int) runs.size(); r++) {
         const auto & run = runs[r];
-        for (int j = 0; j < (int) run.toks->size(); j++) {
-            if (batch.n_tokens == n_batch) {
+        const int len = (int) run.toks->size();
+        if (atomic > 0 && batch.n_tokens > 0 && (len > atomic || batch.n_tokens + len > atomic)) {
+            flush(); // start this run in a fresh decode call
+        }
+        for (int j = 0; j < len; j++) {
+            if (atomic > 0 && len > atomic && batch.n_tokens == atomic) {
+                flush(); // an over-long run is decoded alone, one ubatch at a time
+            }
+            const bool want = run.want && (*run.want)[j];
+            if (batch.n_tokens == n_batch || (want && n_out == n_outputs_max)) {
                 flush();
             }
+            n_out += want;
             const int i = batch.n_tokens++;
             batch.token[i]     = (*run.toks)[j];
             batch.pos[i]       = run.pos0 + j;
@@ -87,12 +102,13 @@ void decode_runs(llama_context * ctx, const std::vector<decide_run> & runs, F &&
 
 } // namespace
 
-void server_decide::init(llama_context * ctx, const llama_model * model, int seq0, int n_seqs, int n_threads) {
+void server_decide::init(llama_context * ctx, const llama_model * model, int seq0, int n_seqs, int n_threads, int n_outputs_max) {
     this->ctx       = ctx;
     this->vocab     = llama_model_get_vocab(model);
     this->seq0      = seq0;
     this->n_seqs    = n_seqs;
     this->n_threads = std::max(1, n_threads);
+    this->n_outputs_max = std::max(1, n_outputs_max);
     // llama.cpp mis-tracks recurrent state when branches copied from one sequence have
     // different lengths in the same batch, so hybrid/recurrent models only batch equal lengths
     this->recurrent_like = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
@@ -109,9 +125,40 @@ json server_decide::run(const json & req) {
     if (!enabled()) {
         throw std::invalid_argument("/decide is disabled; start the server with --decide-seqs N (N >= 3)");
     }
+    // more inputs than sequences allow: split into chunks (half the sequences for inputs, half for branches)
+    {
+        const int max_c = std::max(1, (n_seqs - 1) / 2);
+        const json & all = req.at("contexts");
+        if ((int) all.size() > max_c) {
+            json merged;
+            for (size_t i = 0; i < all.size(); i += max_c) {
+                json sub = req;
+                sub["contexts"] = json(std::vector<json>(all.begin() + i, all.begin() + std::min(all.size(), i + max_c)));
+                json part = run(sub);
+                if (merged.is_null()) {
+                    merged = std::move(part);
+                    continue;
+                }
+                for (auto & r : part["results"]) {
+                    merged["results"].push_back(std::move(r));
+                }
+                for (const char * sect : {"timing", "stats"}) {
+                    for (auto it = part[sect].begin(); it != part[sect].end(); ++it) {
+                        if (it.value().is_number() && merged[sect].contains(it.key())) {
+                            merged[sect][it.key()] = merged[sect][it.key()].get<double>() + it.value().get<double>();
+                        }
+                    }
+                }
+            }
+            merged["stats"]["chunks"] = (all.size() + max_c - 1) / max_c;
+            return merged;
+        }
+    }
+
     const double t_start = decide_now_ms();
     llama_memory_t mem = llama_get_memory(ctx);
     const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int n_ubatch = (int) llama_n_ubatch(ctx);
 
     try {
         // --- static prefix, cached in seq0 across calls
@@ -128,7 +175,7 @@ json server_decide::run(const json & req) {
             llama_memory_seq_rm(mem, seq0, -1, -1);
             cached_prefix.clear();
             std::vector<decide_run> runs = {{(llama_seq_id) seq0, &prefix, 0, nullptr}};
-            decode_runs(ctx, runs, [](auto &) {});
+            decode_runs(ctx, n_outputs_max, 0, runs, [](auto &) {});
             cached_prefix = prefix;
             t_prefix = decide_now_ms() - t0;
         }
@@ -158,7 +205,13 @@ json server_decide::run(const json & req) {
                 llama_memory_seq_cp(mem, seq0, seq0 + 1 + c, -1, -1);
                 runs.push_back({(llama_seq_id) (seq0 + 1 + c), &ctx_toks[c], P, nullptr});
             }
-            decode_runs(ctx, runs, [](auto &) {});
+            if (recurrent_like) {
+                for (const auto & run : runs) { // one input per decode call
+                    decode_runs(ctx, n_outputs_max, n_ubatch, {run}, [](auto &) {});
+                }
+            } else {
+                decode_runs(ctx, n_outputs_max, 0, runs, [](auto &) {});
+            }
         }
         const double t_ctx = decide_now_ms() - t0;
 
@@ -238,7 +291,7 @@ json server_decide::run(const json & req) {
                 llama_memory_seq_cp(mem, seq0 + 1 + b.c, s, -1, -1);
                 runs.push_back({s, &b.toks, P + (llama_pos) ctx_toks[b.c].size(), &b.want});
             }
-            decode_runs(ctx, runs, [&](const std::vector<std::pair<int, int>> & map) {
+            decode_runs(ctx, n_outputs_max, recurrent_like ? n_ubatch : 0, runs, [&](const std::vector<std::pair<int, int>> & map) {
                 std::vector<int> jobs; // batch rows that carry an output we need
                 for (int i = 0; i < (int) map.size(); i++) {
                     if (br[wave[map[i].first]].want[map[i].second]) {
