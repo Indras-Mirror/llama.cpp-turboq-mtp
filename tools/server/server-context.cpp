@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-decide.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -936,6 +937,9 @@ private:
 
     server_batch batch;
 
+    // /decide (parallel multiple-choice scoring) on sequence ids reserved past the slots
+    server_decide decide;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1318,6 +1322,12 @@ private:
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
+        }
+
+        decide.init(ctx_tgt, model_tgt, params_base.n_parallel, params_base.n_seq_extra, params_base.cpuparams.n_threads);
+        if (decide.enabled()) {
+            SRV_INF("/decide enabled: %d reserved sequences (ids %d..%d)\n",
+                    params_base.n_seq_extra, params_base.n_parallel, params_base.n_parallel + params_base.n_seq_extra - 1);
         }
 
         // try speculative decoding
@@ -2701,6 +2711,19 @@ private:
                         });
                     }
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_DECIDE:
+                {
+                    try {
+                        auto res = std::make_unique<server_task_result_decide>();
+                        res->id   = task.id;
+                        res->data = decide.run(task.decide_req);
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        send_error(task, e.what(), ERROR_TYPE_SERVER);
+                    }
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
@@ -4873,6 +4896,28 @@ void server_routes::init_routes() {
             meta->chat_params,
             files);
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
+        return res;
+    };
+
+    this->post_decide = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_DECIDE);
+            task.id         = rd.get_new_id();
+            task.decide_req = json::parse(req.body);
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
         return res;
     };
 

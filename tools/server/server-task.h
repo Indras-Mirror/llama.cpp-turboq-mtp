@@ -27,6 +27,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_DECIDE,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -171,6 +172,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
+
+    // used by SERVER_TASK_TYPE_DECIDE
+    json decide_req;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -548,6 +552,14 @@ struct server_task_result_slot_save_load : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+struct server_task_result_decide : server_task_result {
+    json data;
+
+    virtual json to_json() override {
+        return data;
+    }
 };
 
 struct server_task_result_slot_erase : server_task_result {

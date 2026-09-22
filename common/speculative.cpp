@@ -2283,6 +2283,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+    result.n_seq_extra = 0; // /decide sequences live only on the target context
 
     if (has_draft) {
         result.devices               = params_spec.devices;

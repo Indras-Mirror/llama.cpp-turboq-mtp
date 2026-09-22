@@ -2464,6 +2464,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
+        {"--decide-seqs"}, "N",
+        "enable the /decide endpoint (parallel multiple-choice scoring) with N reserved sequences; "
+        "implies --kv-unified (default: 0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 250) {
+                throw std::invalid_argument("error: --decide-seqs must be in [0, 250]\n");
+            }
+            params.n_seq_extra = value;
+            if (value > 0) {
+                params.kv_unified = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_DECIDE_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
