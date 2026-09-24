@@ -61,6 +61,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const ggml_type idx_type_k =
             (type_k == GGML_TYPE_TBQ3_0 || type_k == GGML_TYPE_TBQ4_0) ? GGML_TYPE_F16 : type_k;
 
+        // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+
         return new llama_kv_cache(
             model, hparams_idx, idx_type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
