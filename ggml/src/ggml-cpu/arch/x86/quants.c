@@ -698,6 +698,61 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+#if defined(__AVX2__)
+    // One Q2_0 block (64 weights, 2 bits each, {0,1,2,3} -> {-1,0,1,2}) pairs with two Q8_0 blocks.
+    // Element j of a 32-wide half lives in byte j/4 at bit offset 2*(j%4): split the 8 packed bytes
+    // into the four bit-planes, then interleave the planes back into element order.
+    const __m128i m3  = _mm_set1_epi8(3);
+    const __m256i one = _mm256_set1_epi8(1);
+
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+
+            const __m128i raw = _mm_loadl_epi64((const __m128i *) &x[i].qs[k * 8]);
+            const __m128i p0  = _mm_and_si128(raw, m3);
+            const __m128i p1  = _mm_and_si128(_mm_srli_epi16(raw, 2), m3);
+            const __m128i p2  = _mm_and_si128(_mm_srli_epi16(raw, 4), m3);
+            const __m128i p3  = _mm_and_si128(_mm_srli_epi16(raw, 6), m3);
+            const __m128i p01 = _mm_unpacklo_epi8(p0, p1);
+            const __m128i p23 = _mm_unpacklo_epi8(p2, p3);
+            const __m256i qx  = _mm256_sub_epi8(
+                MM256_SET_M128I(_mm_unpackhi_epi16(p01, p23), _mm_unpacklo_epi16(p01, p23)), one);
+
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
+            const __m256  d  = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(yb->d));
+
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
