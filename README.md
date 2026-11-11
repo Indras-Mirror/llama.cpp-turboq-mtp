@@ -1,21 +1,90 @@
-# llama.cpp-mtp — Fused TBQ4 Flash Attention + MTP + Shared Tensors
+# llama.cpp-turboq-mtp
 
-> **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** with fused TurboQuant flash attention — the FA kernel reads raw TBQ4_0 K/V blocks directly from global memory and dequants via centroid lookup in the FWHT-rotated domain. No separate dequant pass, no intermediate F16 buffer.
+Maintained by Jack Trefon — [trefon.com](https://trefon.com)
 
-**80-179 tok/s decode (325 effective) with lossless 4.125 bpv KV cache at 262K context on RTX 4090 24GB.**
+This repository is Jack Trefon's fork of [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp), which is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). `master` follows the Indras-Mirror history through 17 May 2026 (`0bc0a270d`). The license is unchanged: MIT, copyright The ggml authors ([LICENSE](LICENSE)).
 
-> ## ⚠️ NVIDIA / RTX-4090-Dedicated Fork
->
-> This is a **separate, NVIDIA-only fork**. It assumes a single **NVIDIA RTX 4090 (Ada Lovelace, sm_89)** with CUDA and makes no attempt at portability to CPU, ROCm, Metal, or other vendors:
-> - Async checkpoint capture relies on **pinned host memory, CUDA streams, and `cudaLaunchHostFunc`** (`cudaStreamPerThread`); non-CUDA builds fall back to the synchronous path.
-> - KV-cache and attention kernels target **TurboQuant TBQ4 / RotorQuant** layouts and the fused Flash-Attention path.
-> - Optimizations (Tensor-Core matmul, fused DeltaNet, MTP) are tuned for one RTX 4090 with 24 GiB VRAM and a 262K-context, lossless-KV workload.
->
-> We do **not** intend to upstream these changes to mainline llama.cpp.
+TurboQuant, the fused KV flash-attention kernel, RotorQuant, multi-token prediction, and every throughput or context-length figure in the [upstream writeup](#upstream-writeup) below come from that upstream line. See [Upstream work](#upstream-work). The list that follows is the work added on this fork, checked against the commits and code on `master`.
 
----
+## What this fork adds
 
-## What This Fork Adds
+### Consumer NVIDIA GPU performance
+
+CUDA work for consumer NVIDIA GPUs. This is separate from TurboQuant and from the fused KV flash-attention kernel, which are upstream.
+
+- Gated DeltaNet prefill uses `GGML_OP_GATED_DELTA_NET_PIPE` (`ggml/src/ggml-cuda/gated_delta_net_pipe.cu`). One launch per layer holds the recurrent state in registers and runs the chunk loop there, in place of the per-chunk matmul chain in `src/models/delta-net-base.cpp`. The kernel still does those matmuls as plain loops.
+- Prompt checkpoints can be copied device-to-host on `cudaStreamPerThread` into a two-slot pinned staging ring. A `cudaLaunchHostFunc` callback then copies them into pageable memory, so prefill is not blocked on the readback. Builds without CUDA keep the synchronous path.
+- `LLAMA_KV_PAD_MIN` (default 4096) is the floor for the KV length used when the CUDA graph is captured. The pad in this code before that change was 256, so the graph was recaptured on a shorter stride. This is a pad change. There is no speed table for it in this repository.
+- `--spec-adapt` watches an exponential moving average of MTP draft acceptance and, below 0.35, drops the draft depth to `--spec-draft-n-min`. Above 0.50 it returns to `--spec-draft-n-max`.
+
+### Sliding-window attention in gated DeltaNet (Qwen)
+
+Qwen3.5 in this tree is a hybrid: gated DeltaNet layers plus sliding-window attention. The MTP shadow context was created with `n_rs_seq = 0`. On a rejected draft the KV rows were removed and the DeltaNet recurrent state was left in place, so the draft state drifted. At long context the draft head repeated one token. The shadow context now uses the same recurrent rollback depth as the target. Qwen3.5 supports partial rollback, so that depth is not clamped. Rejected draft rows are also removed on the target context, which covers the M-RoPE position check on Qwen3.8. When target memory is removed, copied, or shifted, the MTP pending stash is cleared so the draft head is re-seeded.
+
+Context checkpoints on a hybrid model with sliding-window attention called a state-copy path that cannot serialize the SWA cache (the tensor backend is null). That aborted prompts which span more than one prefill batch. Checkpoints are now created only when speculative decoding, MTP, or cache reuse will roll the cache back.
+
+The sliding-window width, and which Qwen layers stay full attention, are set on the Indras-Mirror line (Excidos and Indras-Mirror). Those commits are not in this branch.
+
+### Large-context stability
+
+On top of the DeltaNet rollback above, long contexts were aborting or spinning:
+
+- An MTP draft that indexed past the allocated KV cache asserted inside `ggml_backend_tensor_get`. The draft path returns early instead.
+- With the context full, the server looped on "decode: failed to find a memory slot". If the accumulated position is already at `n_ctx`, the slot returns `exceed_context_size` ("accumulated context is full"). A generation that would run past the context with context-shift disabled returns that same error type.
+- After rejection rollback started trimming the target with `llama_memory_seq_rm` directly, the MTP pending stash still pointed past the trimmed rows. The draft head then stayed desynchronized. The commit note records that loop at about 227K tokens. The stash is reset from `llama_context_seq_rm`, `seq_cp`, and `seq_add`, and after a rejection trim in `accept()`.
+- After 60 MTP rounds that accept every drafted token, the next round samples one token from the target model only. That gives end-of-sequence a chance to win during a tool-call run.
+
+The recurrent-state commit records a 1500-token generation around 95K context and a session through about 200K without the repeated-token lock-up. Those are stability checks from the commit messages. This fork does not add a throughput number for them.
+
+### MLX stability
+
+This repository has no MLX backend, no MLX sources, and no commit that mentions MLX. The item is listed because it is part of the maintainer's stated scope. There is no MLX change here to build or review.
+
+### Hot model reload
+
+The server loads an INI preset file (`--models-preset`; `models.ini` is an example) and can swap models without a restart.
+
+- `POST /models/load` with `{"model": "<preset-key-or-alias>"}` runs the swap on the main loop and returns when the new model is loaded.
+- The same swap runs when `model` on the request names a preset that is not the loaded one, on `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and the Anthropic `/v1/messages` route.
+- The swap waits while a slot is busy, drops tasks that were tokenized with the old vocabulary, drops the prompt cache, and tears down speculative state, the MTP context, and the multimodal context before the model. If the new load fails, the previous model is loaded again.
+- Preset keys are applied on top of the CLI arguments captured at startup, so context size, KV cache type, mmproj, and spec type come from that preset.
+- `GET /v1/models` lists each preset with `status` (`loaded` or `unloaded`) and `context_length` taken from the preset's context-size field.
+- `swap-model.sh` is a client for the load endpoint.
+
+### OpenAI-compatible reasoning and context length
+
+[llama.cpp's server](https://github.com/ggml-org/llama.cpp) already exposes OpenAI-style routes. This fork changes how reasoning mode and context length are applied on those routes:
+
+- `reasoning_effort` accepts `none` and `off` (thinking disabled), `minimal` (512 tokens), `low` (1024), `medium` (2048), `high` (4096), `xhigh` (8192), and `max`, `ultra`, or `unlimited` (no cap). `none` and `off` also set `enable_thinking` off.
+- A numeric `thinking_budget_tokens` or `reasoning_budget_tokens` on the request overrides the word. Either one overrides the server default from `--reasoning-budget` or the preset. With none of these fields set, the configured budget is used.
+- Before the chat template is rendered, messages that do not fit in `n_ctx` minus a margin are dropped from the oldest non-system turns. The margin is the reasoning budget plus 8192, and it is capped at one quarter of `n_ctx`, so an 8K context is not trimmed to an empty budget. The system prompt stays. The last message stays even when that single message is larger than the estimate, so the template still receives the user query. The estimate includes message text and tool-call name, arguments, and id.
+- The Qwen templates under `models/templates` emit `reasoning_content` whenever that field is present, including thinking that sits on a tool turn before the last user message.
+- Tool-call arguments that are not valid JSON are replaced with `{}` and logged, instead of failing the request.
+
+That is the compatibility work on `master`. It is the reasoning-mode and context-length behavior above, on the existing OpenAI-compatible routes.
+
+## Upstream work
+
+- **TurboQuant and the fused KV kernel.** On the Indras-Mirror tree, Excidos added the fused TBQ4 flash-attention path: the kernel reads raw TBQ4 K/V blocks in the attention loop (`ggml/src/ggml-cuda/fattn-mma-tbq4.cuh`, first committed May 2026). The same history's README says the CUDA TurboQuant FWHT kernels were adapted from [spiritbuun](https://github.com/spiritbuun)'s dflash fork. CPU TurboQuant in upstream llama.cpp is [ggml-org/llama.cpp#21089](https://github.com/ggml-org/llama.cpp/pull/21089).
+- **RotorQuant** (planar and iso KV types) was integrated on that fork by Excidos.
+- **Multi-token prediction.** Upstream llama.cpp merged draft-MTP in [ggml-org/llama.cpp#22673](https://github.com/ggml-org/llama.cpp/pull/22673). The Indras-Mirror fork kept its own MTP implementation and published the comparison against that upstream MTP.
+- **A TBQ4 crash fix on this repo, same kernel.** Jean-Maximilien Cadic fixed a misaligned-address crash in the TBQ4 `nstages=2` staging loader ([jtrefon/llama.cpp-turboq-mtp#10](https://github.com/jtrefon/llama.cpp-turboq-mtp/pull/10)). That patch is a fix to the upstream kernel.
+
+Reported speeds in the writeup below, including 80–179 tok/s and the 262K-context RTX 4090 tables, were published by Indras-Mirror and Excidos. They were not re-measured for this repository. [indrasmirror.au](https://indrasmirror.au) is that upstream author's site. The long writeup is [blog-mtp-shared-tensors-200k](https://indrasmirror.au/blog-mtp-shared-tensors-200k.html).
+
+Later Indras-Mirror work (Qwen sliding-window hybrids, Qwen4-Exp SWA, DSV4 KV) is on the `sync/indras-2026-09` branch and is not in `master`.
+
+## Upstream writeup
+
+From here to the credits is the Indras-Mirror / Excidos README as carried in this tree, with a few paragraphs added on this branch (the async-checkpoint, KV-pad, and `--spec-adapt` rows, the production-configuration block, and the 12 July 2026 checkpoint note). Those paragraphs match the CUDA items above. In this writeup, "this fork" and "our fork" mean the Indras-Mirror tree. Every tok/s figure and every context length here is an upstream-reported number, including where this branch repeated it. The quick start clones `Indras-Mirror/llama.cpp-mtp`. This repository is [jtrefon/llama.cpp-turboq-mtp](https://github.com/jtrefon/llama.cpp-turboq-mtp).
+
+### llama.cpp-mtp — fused TBQ4 flash attention, MTP, shared tensors
+
+> Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with fused TurboQuant flash attention. The FA kernel reads raw TBQ4_0 K/V blocks from global memory and dequantizes with a centroid lookup in the FWHT-rotated domain. There is no separate dequant pass and no intermediate F16 buffer. This paragraph is the upstream description.
+
+**Upstream-reported figure, not measured on this fork:** 80-179 tok/s decode (325 effective) with lossless 4.125 bpv KV cache at 262K context on RTX 4090 24GB.
+
+## Upstream feature list
 
 | Feature | Description | Status |
 |---------|-------------|--------|
@@ -55,7 +124,7 @@ The production server (`llama-turboq.service`) runs:
 -c 262144 -ngl 99                         # full context, all layers on GPU
 ```
 
-Current decode throughput at 262K context: **~82 tok/s** (temp 0.6, MTP 3 drafts).
+Upstream-reported decode throughput at 262K context: **~82 tok/s** (temp 0.6, MTP 3 drafts).
 The remaining throughput headroom (target: 70–95% MTP acceptance) requires model-side retraining — see [FASTMTP-RETRAIN.md](FASTMTP-RETRAIN.md).
 
 ### RotorQuant — Next-Gen KV Cache Compression
