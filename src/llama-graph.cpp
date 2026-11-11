@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
+#include "llama-context.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 
@@ -65,6 +66,42 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
+
+// Metal has no fused TBQ flash-attention kernels: TBQ KV on Metal must go
+// through the dequant fallback (cast to F32) with the WHT Q/K/V rotation
+// skipped, since dequantized values are in the original (non-rotated) domain.
+static bool sched_has_metal(ggml_backend_sched_t sched) {
+    if (sched == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); i++) {
+        const ggml_backend_t be = ggml_backend_sched_get_backend(sched, i);
+        if (be && strncmp(ggml_backend_name(be), "Metal", 5) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static ggml_tensor * ggml_mul_mat_aux(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * rot) {
+    const auto n = rot->ne[0];
+
+    ggml_tensor * res;
+
+    if (!ggml_is_contiguous(cur)) {
+        res = ggml_cont_2d   (ctx, cur, n, ggml_nelements(cur)/n);
+    } else {
+        res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    }
+    res = ggml_mul_mat   (ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -2552,6 +2589,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool k_is_tbq = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0;
     const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0;
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // TBQ KV on Metal: no fused FA kernel, dequant fallback instead (see sched_has_metal)
+    const bool tbq_on_metal = (k_is_tbq || v_is_tbq) && sched_has_metal(sched);
     // split the batch into streams if needed
     const auto n_stream = k_is_tbq ? k->ne[2] : (v_is_tbq ? v->ne[2] : k->ne[3]);
 
@@ -2593,6 +2632,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (!use_fused) {
             const ggml_type cast_type = use_flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
             v = ggml_cast(ctx0, v, cast_type);
+            if (tbq_on_metal) {
+                v->op_params[0] = 1;
+            }
             cb(v, use_flash_attn ? "v_rq_f16" : "v_rq_f32", il);
         }
 
@@ -2818,6 +2860,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
+    inp->tbq_cache =
+        mctx_cur->type_k() == GGML_TYPE_TBQ3_0 || mctx_cur->type_k() == GGML_TYPE_TBQ4_0 ||
+        mctx_cur->type_v() == GGML_TYPE_TBQ3_0 || mctx_cur->type_v() == GGML_TYPE_TBQ4_0;
+
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
@@ -2856,6 +2902,8 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    const bool tbq_on_metal = inp->tbq_cache && sched_has_metal(sched);
 
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
@@ -3098,13 +3146,15 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
+    const bool tbq_on_metal = inp->tbq_cache && sched_has_metal(sched);
+
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
         }
     }
-    if (v_rot) {
+    if (v_rot && !tbq_on_metal) {
         if (v_cur) {
             v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
         }
@@ -3386,6 +3436,10 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);
+
+    inp->tbq_cache =
+        mctx_cur->get_base()->type_k() == GGML_TYPE_TBQ3_0 || mctx_cur->get_base()->type_k() == GGML_TYPE_TBQ4_0 ||
+        mctx_cur->get_base()->type_v() == GGML_TYPE_TBQ3_0 || mctx_cur->get_base()->type_v() == GGML_TYPE_TBQ4_0;
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);

@@ -1,5 +1,7 @@
 #include "llama-kv-cache.h"
 
+#include "ggml-turboq-tables.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -360,6 +362,21 @@ llama_kv_cache::llama_kv_cache(
             tmp->data = attn_rot_hadamard[n].data();
 
             ggml_gen_hadamard(tmp);
+
+            if (n == 128) {
+                // signed rotation matching the TBQ codec storage domain
+                // R[i][j]  = s1[i] * H[i][j] * s2[j]  (Q pre-rotation)
+                // R^T[i][j] = s2[i] * H[i][j] * s1[j] (V output post-rotation)
+                attn_rot_signed_k[n] = std::vector<float>(n*n);
+                attn_rot_signed_v[n] = std::vector<float>(n*n);
+                for (int64_t i = 0; i < n; i++) {
+                    for (int64_t j = 0; j < n; j++) {
+                        const float h = attn_rot_hadamard[n][i*n + j];
+                        attn_rot_signed_k[n][i*n + j] = turboq_wht_signs1[i] * h * turboq_wht_signs2[j];
+                        attn_rot_signed_v[n][i*n + j] = turboq_wht_signs2[i] * h * turboq_wht_signs1[j];
+                    }
+                }
+            }
         }
     }
 
@@ -1253,7 +1270,14 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // the pad floor controls how often the CUDA graph must be re-captured; a larger floor (e.g. 4096)
+    // yields far fewer re-capture spikes at the cost of a slightly larger captured graph. tune via
+    // LLAMA_KV_PAD_MIN (defaults to 4096).
+    uint32_t n_pad_min = 4096u;
+    if (const char * env = getenv("LLAMA_KV_PAD_MIN")) {
+        n_pad_min = (uint32_t)std::max(1, atoi(env));
+    }
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -1825,7 +1849,12 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     const auto n_rot = dst->ne[0];
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    if (attn_rot_signed && attn_rot_signed_k.count(n_rot)) {
+        // TBQ KV on Metal: rotate Q by the codec's signed rotation R (s1*H*s2)
+        memcpy(dst->data, attn_rot_signed_k.at(n_rot).data(), ggml_nbytes(dst));
+    } else {
+        memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    }
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
@@ -1834,7 +1863,12 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     const auto n_rot = dst->ne[0];
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    if (attn_rot_signed && attn_rot_signed_v.count(n_rot)) {
+        // TBQ KV on Metal: post-rotate the V attention output by R^T (s2*H*s1)
+        memcpy(dst->data, attn_rot_signed_v.at(n_rot).data(), ggml_nbytes(dst));
+    } else {
+        memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+    }
 }
 
 bool llama_kv_cache::has_cell_ext() const {

@@ -1,31 +1,25 @@
 name: Release
 
 on:
-  workflow_dispatch: # allows manual triggering
+  workflow_dispatch:
     inputs:
       create_release:
         description: 'Create new release'
         required: true
-        type: boolean
+        type: string
+        default: 'true'
+      prod_mark:
+        description: 'Mark release as production (GitHub Latest)'
+        required: true
+        type: string
+        default: 'true'
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        type: string
   push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/release.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl'
-    ]
+    tags:
+      - 'v*'
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -90,9 +84,7 @@ jobs:
       actions: write
 
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -122,10 +114,6 @@ jobs:
 
       - name: Determine tag name
         id: tag
-        uses: ./.github/actions/get-tag-name
-
-      - name: Pack artifacts
-        id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
           tar -czvf llama-${{ steps.tag.outputs.name }}-bin-macos-${{ matrix.build }}.tar.gz -s ",^\.,llama-${{ steps.tag.outputs.name }}," -C ./build/bin .
@@ -265,10 +253,7 @@ jobs:
             sudo apt-get update -y
             sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
           else
-            sudo apt-get update -y
-            sudo apt-get install -y gcc-14 g++-14 build-essential glslc libvulkan-dev spirv-headers libssl-dev ninja-build
-            echo "CC=gcc-14" >> "$GITHUB_ENV"
-            echo "CXX=g++-14" >> "$GITHUB_ENV"
+            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
           fi
 
       - name: ccache
@@ -279,15 +264,8 @@ jobs:
       - name: Build
         id: cmake_build
         run: |
-          cmake -B build \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CPU_ALL_VARIANTS=ON \
-            -DGGML_VULKAN=ON \
-            ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
+          git archive --format=tar.gz -o llama-turboq-${{ steps.tag.outputs.name }}-source.tar.gz \
+            --prefix=llama-turboq-${{ steps.tag.outputs.name }}/ ${{ steps.tag.outputs.name }}
 
       - name: Determine tag name
         id: tag
@@ -322,10 +300,11 @@ jobs:
     env:
       NDK_VERSION: "29.0.14206865"
 
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    needs: source
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -443,8 +422,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev libtbb12 cmake ninja-build python3-pip
-          sudo apt install ocl-icd-opencl-dev opencl-headers opencl-clhpp-headers intel-opencl-icd
+          sudo apt-get install -y build-essential cmake libssl-dev
 
       - name: Use OpenVINO Toolkit Cache
         uses: actions/cache@v5
@@ -1234,7 +1212,6 @@ jobs:
         run: |
           source /opt/intel/oneapi/setvars.sh
           cmake -B build \
-            -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_SYCL=ON \
             -DCMAKE_C_COMPILER=icx \
@@ -1243,24 +1220,21 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_OPENSSL=OFF \
             -DGGML_NATIVE=OFF \
-            -DGGML_SYCL_F16=${{ matrix.fp16 }}
-          time cmake --build build --config Release -j $(nproc)
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF
 
-      - name: Determine tag name
-        id: tag
-        uses: ./.github/actions/get-tag-name
+      - name: Build
+        run: cmake --build build --config Release -j $(nproc)
 
-      - name: Pack artifacts
-        id: pack_artifacts
+      - name: Pack binary tarball
         run: |
           cp LICENSE ./build/bin/
           tar -czvf llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz --transform "s,^\.,llama-${{ steps.tag.outputs.name }}," -C ./build/bin .
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
-          path: llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
-          name: llama-bin-ubuntu-sycl-${{ matrix.build }}-x64.tar.gz
+          name: ubuntu-x64
+          path: llama-turboq-${{ needs.source.outputs.tag }}-ubuntu-x64.tar.gz
 
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
@@ -1284,9 +1258,7 @@ jobs:
             build: 'x64'
 
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -1320,7 +1292,8 @@ jobs:
       - name: Dependencies
         id: depends
         run: |
-          sudo apt install -y build-essential git cmake wget
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev
 
       - name: Setup TheRock with Wheels
         id: therock_env
@@ -1359,7 +1332,7 @@ jobs:
           cmake -B build -S . \
             -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_BACKEND_DL=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr \
             -DGGML_NATIVE=OFF \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -1560,8 +1533,11 @@ jobs:
         id-token: write
         attestations: write
 
+  create-release:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == 'true' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-slim
-
+    permissions:
+      contents: write
     needs:
       - windows
       - windows-cpu
@@ -1584,23 +1560,14 @@ jobs:
       tag_name: ${{ steps.tag.outputs.name }}
 
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ssh-key: ${{ secrets.DEPLOY_KEY_RELEASE }}
 
-      - name: Determine tag name
-        id: tag
-        uses: ./.github/actions/get-tag-name
-
-      - name: Download artifacts
-        id: download-artifact
-        uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v4
         with:
-          path: ./artifact
-          merge-multiple: true
+          path: artifacts
 
       - name: Merge artifacts
         id: move_artifacts
@@ -1671,17 +1638,18 @@ jobs:
           fi
 
       - name: Create release
-        id: create_release
-        uses: ggml-org/action-create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           prerelease: true
           body: |
-            <details open>
+            Pre-built binaries for Ubuntu x64 (CPU).
 
-            ${{ github.event.head_commit.message }}
+            **Includes:**
+            - `llama-server` — HTTP server with OpenAI-compatible API
+            - `llama-cli` — CLI inference tool
+            - `llama-bench` — Benchmark utility
+            - Shared libraries (`libllama.so`, `libggml*.so`)
 
             </details>
 

@@ -342,6 +342,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // override arch from GGUF to load MTP as a separate ctx
+        const char * override_arch;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -943,6 +946,26 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // RTX-4090 / NVIDIA-dedicated: async variant of llama_state_seq_get_data_ext.
+    // Copies the sequence state into a PINNED host buffer (dst) on a dedicated CUDA
+    // stream so the transfer overlaps with subsequent compute. The captured CUDA
+    // event is written to *cuda_event_out (an opaque cudaEvent_t*); the caller must
+    // call llama_state_seq_capture_wait before consuming the data. Falls back to the
+    // synchronous path when CUDA is unavailable.
+    LLAMA_API size_t llama_state_seq_get_data_ext_async(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                        void *     cuda_event_out);
+
+    // RTX-4090 / NVIDIA-dedicated: block until an async checkpoint capture (started
+    // via llama_state_seq_get_data_ext_async) has finished and free its CUDA event.
+    LLAMA_API void   llama_state_seq_capture_wait(
+            struct llama_context * ctx,
+                        void *     cuda_event);
 
     //
     // Decoding

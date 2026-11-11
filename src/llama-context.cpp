@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -19,6 +20,23 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+#ifdef GGML_USE_CUDA
+#define CUDA_CHECK(x)                                                                      \
+    do {                                                                                   \
+        cudaError_t _e = (x);                                                              \
+        if (_e != cudaSuccess) {                                                           \
+            LLAMA_LOG_ERROR("%s: CUDA error %s (%s:%d)\n", #x, cudaGetErrorString(_e),     \
+                            __FILE__, __LINE__);                                           \
+        }                                                                                  \
+    } while (0)
+#else
+#define CUDA_CHECK(x) (void)(x)
+#endif
 
 //
 // llama_context
@@ -602,6 +620,26 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // TBQ KV on a backend without a fused TBQ FA kernel (Metal): the attention
+    // fallback dequantizes in the WHT-rotated domain, so the rotation inputs
+    // must carry the codec's signed matrices (R for Q, R^T for the V output).
+    if (memory) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (hybrid) {
+            llama_kv_cache * kv = hybrid->get_mem_attn();
+            if (kv && (kv->type_k() == GGML_TYPE_TBQ3_0 || kv->type_k() == GGML_TYPE_TBQ4_0 ||
+                       kv->type_v() == GGML_TYPE_TBQ3_0 || kv->type_v() == GGML_TYPE_TBQ4_0)) {
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched.get()); i++) {
+                    const ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), i);
+                    if (be && strncmp(ggml_backend_name(be), "Metal", 5) == 0) {
+                        kv->set_attn_rot_signed(true);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -2624,6 +2662,86 @@ private:
     std::vector<write_info> winfos;
 };
 
+// Async variant: issues device->host copies on cudaStreamPerThread (a stream
+// separate from the compute stream) so they overlap with subsequent compute.
+// The destination buffer MUST be pinned host memory. The caller is responsible
+// for synchronizing the returned event before consuming the data.
+// NOTE: RTX-4090 / NVIDIA-dedicated fork optimization.
+class llama_io_write_host_async : public llama_io_write_i {
+public:
+    llama_io_write_host_async(
+            uint8_t * p, size_t len, ggml_backend_sched_t sched) : ptr(p), buf_size(len)
+#ifdef GGML_USE_CUDA
+            , sched(sched)
+#endif
+    {
+        GGML_UNUSED(sched);
+    }
+
+    ~llama_io_write_host_async() {
+#ifdef GGML_USE_CUDA
+        for (const auto & winfo : winfos) {
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, winfo.tensor);
+            if (backend != nullptr) {
+                ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            } else {
+                // tensor is not assigned in the current scheduler graph (e.g. the MTP
+                // shadow / recurrent state); fall back to a blocking read from its own buffer
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
+        }
+        (void) sched;
+#else
+        for (const auto & winfo : winfos) {
+            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        }
+#endif
+    }
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        winfos.push_back({tensor, ptr, size, offset});
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+
+#ifdef GGML_USE_CUDA
+    ggml_backend_sched_t sched;
+#endif
+
+    struct write_info {
+        ggml_tensor * tensor;
+        uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<write_info> winfos;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
@@ -3079,6 +3197,39 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, void * cuda_event_out) {
+#ifdef GGML_USE_CUDA
+    // Ensure the state is fully computed before issuing the async copies.
+    synchronize();
+
+    llama_io_write_host_async io(dst, size, get_sched());
+
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        state_seq_write_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+
+    // ── barrier: ensure all async D2H copies on backend streams complete
+    //    before the event + host callback on cudaStreamPerThread fire.
+    ggml_backend_sched_synchronize(get_sched());
+
+    cudaEvent_t ev;
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(ev, cudaStreamPerThread));
+
+    *(cudaEvent_t *) cuda_event_out = ev;
+    return size;
+#else
+    (void) cuda_event_out;
+    return state_seq_get_data(seq_id, dst, size, flags);
+#endif
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
@@ -3715,6 +3866,25 @@ llama_context * llama_init_from_model(
         }
     }
 
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
+    }
+
+    // Quality guard for 3-bit TBQ KV (measured 2026-08-11, Qwen3.5-4B, CPU path):
+    // q4_0 K + tbq3_0 V collapses into token repetition from the first token, while
+    // q4_0 K + tbq4_0 V is clean. 4-bit is the supported TBQ path; 3-bit is kept for
+    // experiments (CUDA) behind an explicit env override.
+    if (!getenv("LLAMA_ALLOW_TBQ3_KV")) {
+        if (params.type_v == GGML_TYPE_TBQ3_0) {
+            LLAMA_LOG_ERROR("%s: tbq3_0 V cache is not quality-safe (token repetition on Qwen3.5-4B); use tbq4_0 or q4_0, or set LLAMA_ALLOW_TBQ3_KV=1 to force\n", __func__);
+            return nullptr;
+        }
+        if (params.type_k == GGML_TYPE_TBQ3_0) {
+            LLAMA_LOG_WARN("%s: tbq3_0 K cache is experimental and untested in isolation; set LLAMA_ALLOW_TBQ3_KV=1 to silence\n", __func__);
+        }
+    }
+
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
         params.pooling_type != model->hparams.pooling_type) {
         //user-specified pooling-type is different from the model default
@@ -4177,6 +4347,32 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
+}
+
+// RTX-4090 / NVIDIA-dedicated: async checkpoint capture.
+// Copies the sequence state into a PINNED host buffer on cudaStreamPerThread so
+// the transfer overlaps with subsequent prefill compute. `dst` must be pinned.
+// The event handle is written to *cuda_event_out (caller synchronizes it via
+// llama_state_seq_capture_wait before consuming the data). Falls back to the
+// synchronous path when CUDA is unavailable.
+size_t llama_state_seq_get_data_ext_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, void * cuda_event_out) {
+#ifdef GGML_USE_CUDA
+    return ctx->state_seq_get_data_async(seq_id, dst, size, flags, cuda_event_out);
+#else
+    (void) cuda_event_out;
+    return llama_state_seq_get_data_ext(ctx, dst, size, seq_id, flags);
+#endif
+}
+
+// RTX-4090 / NVIDIA-dedicated: wait for an async checkpoint capture to finish.
+void llama_state_seq_capture_wait(llama_context * /*ctx*/, void * cuda_event) {
+#ifdef GGML_USE_CUDA
+    cudaEvent_t ev = *(cudaEvent_t *) cuda_event;
+    CUDA_CHECK(cudaEventSynchronize(ev));
+    CUDA_CHECK(cudaEventDestroy(ev));
+#else
+    (void) cuda_event;
+#endif
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();

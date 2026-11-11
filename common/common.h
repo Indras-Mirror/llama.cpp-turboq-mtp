@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <atomic>
 #include <string_view>
 #include <vector>
 #include <map>
@@ -330,6 +331,7 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool adapt            = false; // --spec-adapt: throttle draft depth on low MTP acceptance
 
     common_params_model mparams;
 
@@ -367,6 +369,11 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_mtp {
+    llama_model        * model = nullptr;
+    llama_context_params cparams;
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -375,6 +382,7 @@ struct common_params_speculative {
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+    common_params_speculative_mtp   mtp;
 
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
@@ -1176,6 +1184,35 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    common_prompt_checkpoint() = default;
+    ~common_prompt_checkpoint();
+
+    // async capture state holds CUDA resources; transfer ownership on move so the
+    // source no longer frees them. Moves only ever happen before any capture is
+    // in flight (slot vector growth at startup), so the callback pointers stay valid.
+    common_prompt_checkpoint(common_prompt_checkpoint && o) noexcept;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint && o) noexcept;
+
+    // Copies happen at prompt setup, always with an inactive capture, so copying
+    // the plain data and leaving async state at defaults is correct.
+    common_prompt_checkpoint(const common_prompt_checkpoint & o);
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & o);
+
+#ifdef GGML_USE_CUDA
+    // RTX-4090 / NVIDIA-dedicated: async checkpoint capture state.
+    // Captured with llama_state_seq_get_data_ext_async into a pinned staging buffer;
+    // a CUDA host callback copies it into data_tgt/data_dft and releases the slot.
+    // `copied_*` starts true so the non-async path needs no waiting.
+    void *            cuda_event_tgt   = nullptr;
+    void *            cuda_event_dft   = nullptr;
+    int               staging_slot_tgt = -1;
+    int               staging_slot_dft = -1;
+    std::atomic<bool> copied_tgt{true};
+    std::atomic<bool> copied_dft{true};
+    bool              async_active_tgt = false;
+    bool              async_active_dft = false;
+#endif
 
     size_t size() const;
 

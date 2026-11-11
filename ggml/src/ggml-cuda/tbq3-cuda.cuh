@@ -58,6 +58,20 @@ static __device__ __forceinline__ void tbq3_fwht_128(float * x) {
     }
 }
 
+static __device__ __forceinline__ void tbq3_fwht_128_shared(float * x) {
+    for (int len = 1; len < 128; len <<= 1) {
+        for (int i = 0; i < 128; i += 2 * len) {
+            for (int j = 0; j < len; j++) {
+                float u = x[i + j];
+                float v = x[i + j + len];
+                x[i + j] = u + v;
+                x[i + j + len] = u - v;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // ── FWHT rotation (forward / inverse) ──────────────────────────────────────
 
 static __device__ __forceinline__ void tbq3_rotate_forward(

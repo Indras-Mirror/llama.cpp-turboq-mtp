@@ -43,6 +43,16 @@ __device__ __forceinline__ uint8_t sr_quantize_4bit(float val, const float * cen
 
 // ── Planar3: F32[128] → block_planar3_0 ─────────────────────────────
 
+// forward declarations (nvcc -Wmissing-declarations)
+__device__ void quantize_f32_planar3_block(const float * x, block_planar3_0 * dst);
+__device__ void quantize_f32_iso3_block(const float * x, block_iso3_0 * dst);
+__device__ void quantize_f32_planar4_block(const float * x, block_planar4_0 * dst);
+__device__ void quantize_f32_iso4_block(const float * x, block_iso4_0 * dst);
+__device__ void quantize_f32_planar3_block_norot(const float * x, block_planar3_0 * dst);
+__device__ void quantize_f32_iso3_block_norot(const float * x, block_iso3_0 * dst);
+__device__ void quantize_f32_planar4_block_norot(const float * x, block_planar4_0 * dst);
+__device__ void quantize_f32_iso4_block_norot(const float * x, block_iso4_0 * dst);
+
 __device__ void quantize_f32_planar3_block(const float * x, block_planar3_0 * dst) {
     // Norm
     float norm_sq = 0.0f;

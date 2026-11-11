@@ -116,6 +116,8 @@ struct llama_hparams {
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
 
+    bool kv_only_nextn = false;
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;

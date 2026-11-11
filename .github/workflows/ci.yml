@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # CPU build + server tests + binary artifacts (Linux x64)
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j $(nproc)
+
+      - name: Run unit tests
+        run: |
+          ctest --test-dir build --output-on-failure -j $(nproc) -R "^test-chat" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-ubuntu-x64
+          path: build/bin/
+          retention-days: 7
+
+  # NVIDIA consumer target: RTX 4090 (sm_89) Linux CUDA build
+  build-cuda:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt update
+          apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
+
+      - name: Build with CMake
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=89-real \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON
+          cmake --build build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-linux-cuda-x64
+          path: build/bin/
+          retention-days: 7
+
+  # Apple Silicon Metal build
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_METAL=ON \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --config Release -j 4
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-macos-arm64
+          path: build/bin/
+          retention-days: 7

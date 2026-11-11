@@ -1344,6 +1344,34 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required) {
+    const struct ggml_tensor * cur = check_tensor_dims(name, std::vector<int64_t>(ne), required, /*allow_reshape=*/false);
+
+    if (cur == NULL) {
+        return NULL;
+    }
+
+    if (cur->type != base->type) {
+        throw std::runtime_error(format("%s: tensor '%s' has wrong type; expected %s, got %s", __func__, name.c_str(), ggml_type_name(base->type), ggml_type_name(cur->type)));
+    }
+
+    std::array<int64_t, GGML_MAX_DIMS> dims;
+    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        dims[i] = i < ne.size() ? ne.begin()[i] : 1;
+    }
+
+    struct ggml_tensor * tensor = ggml_view_4d(ctx, base,
+                                    dims[0], dims[1], dims[2], dims[3],
+                                    cur->nb[1], cur->nb[2], cur->nb[3],
+                                    offset);
+
+    ggml_set_name(tensor, name.c_str());
+
+    n_created++;
+
+    return tensor;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));

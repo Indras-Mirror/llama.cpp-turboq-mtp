@@ -15,6 +15,30 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <algorithm>
+#include <cctype>
+
+// Map a reasoning-effort WORD (OpenAI-compatible `reasoning_effort`) to a token budget.
+// Returns true if the word is recognized (budget set); false if unrecognized (caller
+// falls back to the config default). Budget values:
+//   0    = thinking disabled (immediate end)
+//   N>0  = token budget
+//   -1   = unlimited (the top level)
+// Ladder: none/off=off  minimal=512  low=1024  medium=2048  high=4096  xhigh=8192  max/ultra/unlimited=unlimited
+static bool reasoning_effort_to_budget(const std::string & word, int & budget) {
+    std::string w = word;
+    std::transform(w.begin(), w.end(), w.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    if (w.empty())                          return false;
+    if (w == "none" || w == "off")          { budget = 0;    return true; }
+    if (w == "minimal")                     { budget = 512;  return true; }
+    if (w == "low")                         { budget = 1024; return true; }
+    if (w == "medium")                      { budget = 2048; return true; }
+    if (w == "high")                        { budget = 4096; return true; }
+    if (w == "xhigh")                       { budget = 8192; return true; }
+    if (w == "max" || w == "ultra" ||
+        w == "unlimited")                   { budget = -1;   return true; }
+    return false;                            // unrecognized -> config fallback
+}
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1320,18 +1344,128 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
+    // Parse the OAI "reasoning_effort" field; "none"/"off" disables reasoning.
+    // NOTE: the word is intentionally NOT forwarded into the chat template: model
+    // templates validate the value (e.g. Qwen3.8 accepts only low/medium/xhigh)
+    // and raise on OpenAI-style words (high/max/...). The word is instead mapped
+    // to a hard token budget in the reasoning-budget block below.
     if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
-        if (reasoning_effort == "none") {
+        std::string e = json_value(body, "reasoning_effort", std::string(""));
+        std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        if (e == "none" || e == "off") {
             inputs.enable_thinking = false;
-            inputs.chat_template_kwargs.erase("reasoning_effort");
-        } else if (!reasoning_effort.empty()) {
-            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
 
     inputs.force_pure_content = opt.force_pure_content;
+
+    // ──── PROMPT TRIMMING ────
+    // Trim from the TOP of the conversation (after system prompt) when over budget.
+    // Keeps: system prompt + the most recent N messages that fit within n_ctx - margin.
+    // Drops: old history messages from the top of the conversation.
+    // No middle gaps — system prompt transitions directly to the oldest kept message.
+    // This ensures the rendered prompt shares a long prefix with the cached KV
+    // so n_past is large, checkpoints can be restored, and only the delta
+    // (new tokens) gets processed instead of a full prefill reload.
+    {
+        // reserve at most 1/4 of the context for reasoning/tool output; on small
+        // contexts the fixed 8K margin would consume the whole window (budget -> 0
+        // and every request trims the full conversation)
+        const size_t margin = std::min<size_t>(
+                std::max<int>(opt.reasoning_budget + 8192, 8192),
+                std::max<size_t>(1, opt.n_ctx) / 4);
+        const size_t budget = std::max<size_t>(1, opt.n_ctx) - margin;
+
+        auto estimate_msg_tokens = [vocab = opt.vocab](const common_chat_msg & msg) -> size_t {
+            std::string text;
+            text += msg.content;
+            text += msg.reasoning_content;
+            for (const auto & part : msg.content_parts) {
+                text += part.text;
+            }
+            for (const auto & tc : msg.tool_calls) {
+                text += tc.name;
+                text += tc.arguments;
+                text += tc.id;
+            }
+            size_t n;
+            if (vocab != nullptr && !text.empty()) {
+                // exact token count (no special tokens added)
+                const int32_t k = llama_tokenize(vocab, text.data(), (int32_t) text.size(), nullptr, 0, false, false);
+                n = k < 0 ? (size_t) (-k) : (size_t) k;
+            } else {
+                // fallback heuristic when no tokenizer is available
+                n = text.size() / 2;
+            }
+            return n + 5; // + template overhead (~5 tokens per message for markers + role text)
+        };
+
+        size_t total = 0;
+        for (const auto & msg : inputs.messages) {
+            total += estimate_msg_tokens(msg);
+        }
+
+        if (total > budget) {
+            // Find system prompt (usually the first message, role="system")
+            int sys_idx = -1;
+            for (int i = 0; i < (int)inputs.messages.size(); i++) {
+                if (inputs.messages[i].role == "system") {
+                    sys_idx = i;
+                    break;
+                }
+            }
+
+            // Per-message estimates
+            std::vector<size_t> msg_tokens(inputs.messages.size());
+            for (int i = 0; i < (int)inputs.messages.size(); i++) {
+                msg_tokens[i] = estimate_msg_tokens(inputs.messages[i]);
+            }
+
+            // Walk backwards from the last message to find how many recent ones fit.
+            // Everything before the first kept recent message gets dropped (trim from top).
+            size_t sys_cost    = (sys_idx >= 0) ? msg_tokens[sys_idx] : 0;
+            size_t recent_cost = 0;
+            int first_kept     = (int)inputs.messages.size(); // index of first kept message
+
+            for (int i = (int)inputs.messages.size() - 1; i >= 0; i--) {
+                if (i == sys_idx) continue;
+                if (sys_cost + recent_cost + msg_tokens[i] > budget) break;
+                recent_cost += msg_tokens[i];
+                first_kept = i;
+            }
+
+            // Never drop the last message (the active user query): if it alone
+            // exceeds the budget (e.g. a large single-message document whose
+            // estimate overshoots), keep it anyway and let the slot handle the
+            // length — otherwise the prompt silently loses its query and the
+            // template raises "No user query found in messages".
+            if (first_kept > (int)inputs.messages.size() - 1) {
+                first_kept = (int)inputs.messages.size() - 1;
+            }
+
+            // Rebuild if we need to drop anything (messages between sys and first_kept)
+            if (first_kept > (sys_idx >= 0 ? sys_idx + 1 : 0)) {
+                std::vector<common_chat_msg> trimmed;
+                if (sys_idx >= 0) {
+                    trimmed.push_back(inputs.messages[sys_idx]);           // keep system prompt
+                }
+                for (int i = first_kept; i < (int)inputs.messages.size(); i++) {
+                    if (i == sys_idx) continue;
+                    trimmed.push_back(inputs.messages[i]);                // keep recent messages
+                }
+
+                int kept    = (int)trimmed.size();
+                int dropped = (int)inputs.messages.size() - kept;
+                SRV_INF("trimmed prompt: %d messages -> %d (dropped %d old history messages), "
+                        "est. %zu tokens -> %zu tokens\n",
+                        (int)inputs.messages.size(), kept, dropped,
+                        total, sys_cost + recent_cost);
+
+                inputs.messages = std::move(trimmed);
+            }
+        }
+    }
+    // ──── END TRIMMING ────
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
@@ -1360,12 +1494,30 @@ json oaicompat_chat_params_parse(
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
-    // Reasoning budget: pass parameters through to sampling layer
+    // Reasoning budget: pass parameters through to sampling layer.
+    // Precedence (highest wins):
+    //   1. raw per-request number  (thinking_budget_tokens / reasoning_budget_tokens)
+    //   2. reasoning_effort WORD   (mapped via reasoning_effort_to_budget)
+    //   3. server config default   (opt.reasoning_budget, from models.ini / --reasoning-budget)
+    // A request always overrides config; config is the fallback when no field is sent.
     {
-        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+        int reasoning_budget = opt.reasoning_budget;   // 3: config default (fallback)
+
+        // 2: reasoning_effort word (OpenAI-compatible top-level field)
+        if (body.contains("reasoning_effort")) {
+            const std::string effort = json_value(body, "reasoning_effort", std::string(""));
+            int word_budget = 0;
+            if (reasoning_effort_to_budget(effort, word_budget)) {
+                reasoning_budget = word_budget;
+            }
+        }
+
+        // 1: raw per-request number (highest priority; -1 = unlimited, 0 = immediate end)
+        if (body.contains("thinking_budget_tokens")) {
+            reasoning_budget = json_value(body, "thinking_budget_tokens", reasoning_budget);
+        }
+        if (body.contains("reasoning_budget_tokens")) {
+            reasoning_budget = json_value(body, "reasoning_budget_tokens", reasoning_budget);
         }
 
         if (!chat_params.thinking_end_tags.empty()) {

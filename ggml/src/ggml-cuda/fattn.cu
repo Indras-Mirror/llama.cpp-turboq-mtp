@@ -353,7 +353,6 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
     BEST_FATTN_KERNEL_MMA_TBQ4 = 500,
-
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {

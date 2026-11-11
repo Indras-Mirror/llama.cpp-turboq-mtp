@@ -277,19 +277,23 @@ static __device__ __forceinline__ void flash_attn_ext_tbq4_load_raw_async(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int blocks_per_row = D / 128;
-    constexpr int raw_row_bytes  = blocks_per_row * (int)sizeof(block_tbq4_0); // 132 for D=256
-    constexpr int ints_per_row   = raw_row_bytes / 4;                           // 33 for D=256
-    constexpr int total_ints     = nbatch_fa * ints_per_row;
+    constexpr int raw_row_bytes  = blocks_per_row * (int)sizeof(block_tbq4_0); // 66 for D=128, 132 for D=256
+    constexpr int total_bytes    = nbatch_fa * raw_row_bytes;
     constexpr int nthreads       = nwarps * warp_size;
+    constexpr int row_stride     = tbq4_staging_row_bytes<D>();
 
-    // Distribute int-sized chunks across threads for coalesced access.
-    for (int idx = threadIdx.y * warp_size + threadIdx.x; idx < total_ints; idx += nthreads) {
-        const int row   = idx / ints_per_row;
-        const int off   = (idx % ints_per_row) * 4;
+    // block_tbq4_0 is 66 bytes, so a source row (raw_row_bytes) is a multiple of 66 and is NOT
+    // 4-byte aligned for D=128: every odd row starts at a 2-mod-4 offset. A 4-byte int copy from
+    // those offsets faults with "CUDA error: misaligned address", and rounding raw_row_bytes down
+    // to whole ints also drops each block's final 2 bytes (qs[62], qs[63]). Copy byte-wise so the
+    // load is alignment-agnostic and every byte of every block reaches the staging buffer.
+    // Consecutive threads read consecutive bytes, so global loads stay coalesced.
+    for (int idx = threadIdx.y * warp_size + threadIdx.x; idx < total_bytes; idx += nthreads) {
+        const int row = idx / raw_row_bytes;
+        const int off = idx % raw_row_bytes;
 
         if (row < i_sup) {
-            const int src = __ldg((const int *)(data_raw + (int64_t)row * stride_bytes + off));
-            *(int *)(staging + (int64_t)row * tbq4_staging_row_bytes<D>() + off) = src;
+            staging[(int64_t)row * row_stride + off] = data_raw[(int64_t)row * stride_bytes + off];
         }
         // OOB rows: staging left uninitialized. Dequant zero-fill handles cleanup.
     }
