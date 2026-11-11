@@ -2,7 +2,7 @@
 
 > **Fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)** with fused TurboQuant flash attention — the FA kernel reads raw TBQ4_0 K/V blocks directly from global memory and dequants via centroid lookup in the FWHT-rotated domain. No separate dequant pass, no intermediate F16 buffer.
 
-**80-179 tok/s decode (325 effective) with lossless 4.25 bpv KV cache at 262K context on RTX 4090 24GB.**
+**80-179 tok/s decode (325 effective) with lossless 4.125 bpv KV cache at 262K context on RTX 4090 24GB.**
 
 > ## ⚠️ NVIDIA / RTX-4090-Dedicated Fork
 >
@@ -50,7 +50,7 @@ The production server (`llama-turboq.service`) runs:
 --jinja                                    # model's native Qwen3.5 chat template
 --spec-type mtp --spec-draft-n-max 3      # MTP speculative decoding
 --spec-adapt                              # adaptive draft-depth guard
--ctk tbq4_0 -ctv tbq4_0                  # TBQ4 lossless KV (4.25 bpv, ~4 GiB @ 262K)
+-ctk tbq4_0 -ctv tbq4_0                  # TBQ4 lossless KV (4.125 bpv, ~4 GiB @ 262K)
 --flash-attn on                           # fused dequant + FA kernel
 -c 262144 -ngl 99                         # full context, all layers on GPU
 ```
@@ -66,11 +66,11 @@ The remaining throughput headroom (target: 70–95% MTP acceptance) requires mod
 
 | Type | Bits | Block | Rotation | VRAM @ 262K |
 |------|------|-------|----------|-------------|
-| `tbq4_0` | 4.25 | 66 bytes/128 dims | FWHT butterfly | 4224 MiB |
-| `planar3_0` | 3.0 | 50 bytes/128 dims | 2D Givens pairs | **3200 MiB** (-24%) |
-| `iso3_0` | 3.0 | 50 bytes/128 dims | 4D quaternion | **3200 MiB** (-24%) |
-| `planar4_0` | 4.0 | 66 bytes/128 dims | 2D Givens pairs | 4224 MiB |
-| `iso4_0` | 4.0 | 66 bytes/128 dims | 4D quaternion | 4224 MiB |
+| `tbq4_0` | 4.125 | 66 bytes/128 dims | FWHT butterfly | 4224 MiB |
+| `planar3_0` | 3.125 | 50 bytes/128 dims | 2D Givens pairs | **3200 MiB** (-24%) |
+| `iso3_0` | 3.125 | 50 bytes/128 dims | 4D quaternion | **3200 MiB** (-24%) |
+| `planar4_0` | 4.125 | 66 bytes/128 dims | 2D Givens pairs | 4224 MiB |
+| `iso4_0` | 4.125 | 66 bytes/128 dims | 4D quaternion | 4224 MiB |
 
 #### Benchmark (RTX 4090, Qwen3.6-27B, MTP+FA)
 
@@ -162,7 +162,7 @@ We tested upstream `draft-mtp` (PR #22673, merged May 16) against our custom MTP
 |--------|:-----------:|:--------:|:-----:|
 | **Generation speed** | 71.5 tok/s | 82-93 tok/s | **+15-30%** |
 | **Draft acceptance** | 47-89% | 73-98% (avg 92%) | **+3-45 pp** |
-| **KV cache type** | Q4_0 (4.5 bpv) | TBQ4_0 (4.25 bpv) | 6% more compression |
+| **KV cache type** | Q4_0 (4.5 bpv) | TBQ4_0 (4.125 bpv) | 8% smaller |
 | **Max context @ 24GB** | ~131K | **262K** | **2x** |
 | **262K context VRAM** | ❌ Won't fit (needs 32 GB) | ✅ ~20 GB | — |
 | **Fused quant FA** | ❌ Separate dequant pass | ✅ Inline dequant in FA loop | Memory + speed |
@@ -170,7 +170,7 @@ We tested upstream `draft-mtp` (PR #22673, merged May 16) against our custom MTP
 | **RotorQuant** | ❌ | ✅ planar3/iso3/planar4/iso4 | 3-4 bit KV cache options |
 | **Multi-turn cache** | ✅ Checkpoints (native) | ✅ Checkpoints (our fix) | Same mechanism |
 
-**Why we are not adopting upstream MTP:** Upstream's implementation is a clean starting point, but our fork's TBQ4 fused flash attention + RotorQuant + tensor sharing stack delivers significantly higher performance, 2x the context capacity, and better draft acceptance. Upstream MTP lacks the KV cache compression needed for 262K context on consumer GPUs — the TBQ4_0 format (4.25 bpv) is the critical differentiator, using only 4.2 GB for KV cache vs 16.4 GB for upstream's Q4_0 at 262K.
+**Why we are not adopting upstream MTP:** Upstream's implementation is a clean starting point, but our fork's TBQ4 fused flash attention + RotorQuant + tensor sharing stack delivers significantly higher performance, 2x the context capacity, and better draft acceptance. Upstream MTP lacks the KV cache compression needed for 262K context on consumer GPUs — the TBQ4_0 format (4.125 bpv) is the critical differentiator, using only 4.2 GB for KV cache vs 16.4 GB for upstream's Q4_0 at 262K.
 
 **Upstream commits assessed (20 total, May 14-17):** Of 40+ commits since our sync point, the vast majority are AMD/Vulkan/WebGPU/Hexagon/SYCL backend changes, CI fixes, web UI updates, and Docker configs — none relevant to our CUDA single-GPU setup. The few potentially useful commits (Qwen3.5 tokenizer improvements, reasoning-budget deep-copy fix, server log reduction) are minor quality-of-life improvements that do not warrant destabilizing our stable build. They will be picked up in the next scheduled sync.
 
@@ -178,9 +178,9 @@ We tested upstream `draft-mtp` (PR #22673, merged May 16) against our custom MTP
 
 | Config | Context | KV Cache | tok/s | Draft Accept | VRAM |
 |--------|---------|----------|-------|-------------|------|
-| **MTP + Fused TBQ4 FA (May 11)** | **262K** | **TBQ4_0 (4.25 bpv)** | **179.4** | **81.4%** | **~20 GB** |
-| **MTP + Fused TBQ4 FA** | **262K** | **TBQ4_0 (4.25 bpv)** | **80-87** | **73-93%** | **~20 GB** |
-| MTP + Fused TBQ4 FA | 200K | TBQ4_0 (4.25 bpv) | 82-87 | 73% | ~20 GB |
+| **MTP + Fused TBQ4 FA (May 11)** | **262K** | **TBQ4_0 (4.125 bpv)** | **179.4** | **81.4%** | **~20 GB** |
+| **MTP + Fused TBQ4 FA** | **262K** | **TBQ4_0 (4.125 bpv)** | **80-87** | **73-93%** | **~20 GB** |
+| MTP + Fused TBQ4 FA | 200K | TBQ4_0 (4.125 bpv) | 82-87 | 73% | ~20 GB |
 | MTP + Q4_0 KV | 200K | Q4_0 (4.5 bpv) | 92-97 | 93.6% | 23.96 GB |
 | MTP + Q4_0 KV | 135K | Q4_0 (4.5 bpv) | 97-103 | 93.6% | 22.4 GB |
 | Baseline (no MTP, Q4_0 KV) | 200K | Q4_0 | ~40 | - | 23.96 GB |
@@ -213,7 +213,7 @@ cd llama.cpp-mtp
 cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build -j$(nproc) --config Release
 
-# Fused TBQ4 FA + MTP (80-87 tok/s at 262K, lossless 4.25 bpv KV)
+# Fused TBQ4 FA + MTP (80-87 tok/s at 262K, lossless 4.125 bpv KV)
 ./build/bin/llama-server \
   -m your-qwen3.6-mtp.gguf \
   --spec-type mtp --spec-draft-n-max 3 \
@@ -272,7 +272,7 @@ K/V are pre-rotated at SET_ROWS time (`quantize_f32_tbq4_0_block` calls `tbq4_ro
 ### TBQ4_0 Block Format
 
 ```c
-struct block_tbq4_0 {      // 66 bytes per 128 elements (4.25 bits per value)
+struct block_tbq4_0 {      // 66 bytes per 128 elements (4.125 bits per value)
     ggml_half d;            // corrected L2 norm (2 bytes)
     uint8_t qs[QK_TBQ4/2]; // packed 4-bit centroid indices (64 bytes)
 };
@@ -341,7 +341,7 @@ Implemented for `qwen35_mtp` and `qwen35moe_mtp`. Saves 682 MiB with zero qualit
 | Flag | Purpose |
 |------|---------|
 | `--spec-type mtp --spec-draft-n-max 3` | Enable MTP speculative decoding |
-| `-ctk tbq4_0 -ctv tbq4_0` | Fused TBQ4 KV cache (lossless, 4.25 bpv) |
+| `-ctk tbq4_0 -ctv tbq4_0` | Fused TBQ4 KV cache (lossless, 4.125 bpv) |
 | `-ctk q4_0 -ctv q4_0` | Q4_0 KV cache (higher speed, more VRAM) |
 | `-ub 32` | Small ubatch keeps MTP compute buffer at ~712 MiB |
 | `-np 1` | MTP only supports single parallel slot |

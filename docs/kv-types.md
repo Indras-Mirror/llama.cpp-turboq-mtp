@@ -8,8 +8,8 @@ Both types quantize 128-element blocks with a Walsh-Hadamard rotation:
 
 | type | bits/value | block | layout | notes |
 |---|---|---|---|---|
-| `tbq3_0` | 3.0 | 50 B | `half d` + 48 B packed 3-bit indices | 8 Lloyd-Max centroids (FWHT domain) |
-| `tbq4_0` | 4.25 | 66 B | `half d` + 64 B packed 4-bit indices | 16 Lloyd-Max centroids (FWHT domain) |
+| `tbq3_0` | 3.125 | 50 B | `half d` + 48 B packed 3-bit indices | 8 Lloyd-Max centroids (FWHT domain) |
+| `tbq4_0` | 4.125 | 66 B | `half d` + 64 B packed 4-bit indices | 16 Lloyd-Max centroids (FWHT domain) |
 
 Values are stored in the **WHT-rotated domain**: quantize applies `s1 -> WHT128 -> s2`
 (plus norm correction `d = ||x|| / ||centroids||`), dequantize inverts. Because WHT
