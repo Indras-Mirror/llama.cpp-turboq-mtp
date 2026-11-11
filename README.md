@@ -2,7 +2,7 @@
 
 Maintained by Jack Trefon — [trefon.com](https://trefon.com)
 
-This repository is Jack Trefon's fork of [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp), which is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). `master` follows the Indras-Mirror history through 17 May 2026 (`0bc0a270d`). The license is unchanged: MIT, copyright The ggml authors ([LICENSE](LICENSE)).
+This repository is Jack Trefon's fork of [Indras-Mirror/llama.cpp-mtp](https://github.com/Indras-Mirror/llama.cpp-mtp), which is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). `master` follows the Indras-Mirror history through 2 September 2026 (`8f2b24374`), with the fork's feature work on top. The license is unchanged: MIT, copyright The ggml authors ([LICENSE](LICENSE)).
 
 TurboQuant, the fused KV flash-attention kernel, RotorQuant, multi-token prediction, and every throughput or context-length figure in the [upstream writeup](#upstream-writeup) below come from that upstream line. See [Upstream work](#upstream-work). The list that follows is the work added on this fork, checked against the commits and code on `master`.
 
@@ -23,7 +23,7 @@ Qwen3.5 in this tree is a hybrid: gated DeltaNet layers plus sliding-window atte
 
 Context checkpoints on a hybrid model with sliding-window attention called a state-copy path that cannot serialize the SWA cache (the tensor backend is null). That aborted prompts which span more than one prefill batch. Checkpoints are now created only when speculative decoding, MTP, or cache reuse will roll the cache back.
 
-The sliding-window width, and which Qwen layers stay full attention, are set on the Indras-Mirror line (Excidos and Indras-Mirror). Those commits are not in this branch.
+The sliding-window width, and which Qwen layers stay full attention, are set on the Indras-Mirror line (Excidos and Indras-Mirror). Those commits are included in `master` as of the September 2026 sync.
 
 ### Large-context stability
 
@@ -72,7 +72,7 @@ That is the compatibility work on `master`. It is the reasoning-mode and context
 
 Reported speeds in the writeup below, including 80–179 tok/s and the 262K-context RTX 4090 tables, were published by Indras-Mirror and Excidos. They were not re-measured for this repository. [indrasmirror.au](https://indrasmirror.au) is that upstream author's site. The long writeup is [blog-mtp-shared-tensors-200k](https://indrasmirror.au/blog-mtp-shared-tensors-200k.html).
 
-Later Indras-Mirror work (Qwen sliding-window hybrids, Qwen4-Exp SWA, DSV4 KV) is on the `sync/indras-2026-09` branch and is not in `master`.
+Later Indras-Mirror work (Qwen sliding-window hybrids, Qwen4-Exp SWA, DSV4 KV) is included in `master` as of the September 2026 sync (`sync/indras-2026-09`).
 
 ## Upstream writeup
 

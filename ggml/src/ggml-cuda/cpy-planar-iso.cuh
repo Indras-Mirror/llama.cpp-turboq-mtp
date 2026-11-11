@@ -1,12 +1,6 @@
 #pragma once
 
-#if defined(GGML_USE_HIP)
-#include "vendors/hip.h"
-#elif defined(GGML_USE_MUSA)
-#include "vendors/musa.h"
-#else
-#include "vendors/cuda.h"
-#endif
+#include <cuda_runtime.h>
 #include <stdint.h>
 
 // Initialize rotation constants for planar/iso CUDA kernels.

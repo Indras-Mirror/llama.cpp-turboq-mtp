@@ -88,47 +88,15 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
 
-// FaTypeK / FaTypeV spec constant values. These mirror enum ggml_type so the
-// host can pass the type directly. Keep in sync with ggml.h.
-#define FA_TYPE_F32   0u
-#define FA_TYPE_F16   1u
-#define FA_TYPE_Q4_0  2u
-#define FA_TYPE_Q4_1  3u
-#define FA_TYPE_Q5_0  6u
-#define FA_TYPE_Q5_1  7u
-#define FA_TYPE_Q8_0  8u
-#define FA_TYPE_Q1_0 41u
+#include "fa_types.glsl"
 
-// Number of matrix elements per buffer block, derived from the K/V type spec
-// constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
-// and bypasses the dequant path entirely. Quants follow their ggml block sizes.
-uint fa_block_elems(uint ty) {
-    switch (ty) {
-        case FA_TYPE_F32:  return 4u;
-        case FA_TYPE_F16:  return 1u;
-        case FA_TYPE_Q4_0: return uint(QUANT_K_Q4_0);
-        case FA_TYPE_Q4_1: return uint(QUANT_K_Q4_1);
-        case FA_TYPE_Q5_0: return uint(QUANT_K_Q5_0);
-        case FA_TYPE_Q5_1: return uint(QUANT_K_Q5_1);
-        case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
-        case FA_TYPE_Q1_0: return uint(QUANT_K_Q1_0); // cm2-only, harmless elsewhere
-        default:           return 1u;
-    }
-}
-
-// QUANT_R_MMQ for FA-eligible K types. Q4_*/Q5_* store two nibbles per byte
-// (R==2); Q8_0 stores one byte per element (R==1). Used to derive the number
-// of int32s per 32-element block on the MMQ K path: ints_per_block == 8 / R.
-uint fa_quant_r_mmq(uint ty) {
-    switch (ty) {
-        case FA_TYPE_Q4_0: return uint(QUANT_R_Q4_0);
-        case FA_TYPE_Q4_1: return uint(QUANT_R_Q4_1);
-        case FA_TYPE_Q5_0: return uint(QUANT_R_Q5_0);
-        case FA_TYPE_Q5_1: return uint(QUANT_R_Q5_1);
-        case FA_TYPE_Q8_0: return uint(QUANT_R_Q8_0);
-        default:           return 1u;
-    }
-}
+#if defined(BFLOAT16)
+#define O_TYPE float
+#define O_TYPEV4 vec4
+#else
+#define O_TYPE FLOAT_TYPE
+#define O_TYPEV4 FLOAT_TYPEV4
+#endif
 
 // These can't be `const` globals because GLSL forbids function calls in global
 // const initializers, even when the spec constants would let the driver fold
@@ -248,7 +216,7 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
 // Store the output when doing grouped query attention.
 // Rows index by Q's dimension 2, and the first N rows are valid.
-void gqaStore(const in uint32_t r, const in uint32_t c, const in FLOAT_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
+void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     uint32_t offset = (iq2 + r) * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);

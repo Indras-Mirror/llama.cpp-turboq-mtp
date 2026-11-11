@@ -517,6 +517,8 @@ static void unpack_3bit(uint8_t * indices, const uint8_t * src, int64_t n) {
 
 static void tbq4_fwht_128(float * x); // forward decl — defined below in TBQ4_0 section
 
+// Unnormalized FWHT for TBQ3 — matches CUDA tbq3_fwht_128 (no inv_sqrt_128 scaling).
+// TBQ3 centroids are fitted to the unnormalized domain, so inverse needs x inv_sqrt_128.
 static void tbq3_fwht_128_cpu(float * x) {
     for (int h = 1; h < 128; h *= 2) {
         for (int i = 0; i < 128; i += h * 2) {
